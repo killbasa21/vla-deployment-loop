@@ -1,0 +1,10 @@
+[project]
+name = "greenbox"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mujoco>=3.10.0",
+    "pillow>=12.3.0",
+]
