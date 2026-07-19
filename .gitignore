@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Vendored repos (cloned for reference, not part of this project)
+mujoco_menagerie/
+molmoact2/
