@@ -12,3 +12,22 @@ wheels/
 # Vendored repos (cloned for reference, not part of this project)
 mujoco_menagerie/
 molmoact2/
+
+# Per-run debug artifacts (camera frames + jsonl logs) -- see CLAUDE.md.
+# Bulky and regenerated every run; previously committed by accident and had
+# to be purged (see "deleted major assets" commit) -- don't repeat that.
+assets/
+
+# Locally generated LeRobot datasets. The source of truth is the Modal data
+# volume / reproduced collection command, not git history.
+data/
+
+# Fine-tune checkpoints are large binary artifacts. Keep run_info.md metadata
+# in git, but never commit pulled checkpoint shards or partial downloads.
+# NOTE: a directory-name-specific pattern here (e.g. fine_tunes/**/checkpoints/)
+# is not enough -- pulled checkpoints don't always land under a "checkpoints/"
+# dir (e.g. fine_tunes/pick_up_tasks/lora_train/step500-merged/model.pt), so
+# ignore everything under fine_tunes/ except run_info.md.
+fine_tunes/**
+!fine_tunes/**/
+!fine_tunes/**/run_info.md

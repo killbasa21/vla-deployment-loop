@@ -18,8 +18,13 @@ Usage:
     modal serve phase3_modal.py        # ephemeral dev server, live-reloads on save
     modal deploy phase3_modal.py       # persistent deployment, prints the URL
 
-Then point phase3_closed_loop.py's SERVER_URL at the printed
-https://<workspace>--molmoact2-droid-serve.modal.run/act URL.
+Then point phase3_closed_loop.py's SERVER_URL (or its --server-url flag) at the
+printed URL + "/act". The slug is longer than you'd guess from the class name
+alone -- Modal includes both the app name and the @app.cls name in it, so it's
+https://<workspace>--molmoact2-droid-molmoactdroidserver-serve.modal.run/act,
+not https://<workspace>--molmoact2-droid-serve.modal.run/act. Always confirm
+against `modal deploy`'s own printed "Created Web Function URL" line rather
+than reconstructing it by hand.
 """
 
 import modal
