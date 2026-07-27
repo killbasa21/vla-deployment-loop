@@ -169,10 +169,14 @@ def throttle_query_rate(last_query_time, interval_s):
     return time.time()
 
 
-def capture_and_submit(executor, renderer, data, model, tracked_body_id, server_url, send_wrist, timeout):
+def capture_and_submit(executor, renderer, data, model, tracked_body_id, server_url, send_wrist, timeout,
+                       tick=0):
     """Render + read state *now* (must happen on the main thread -- mujoco.Renderer's
     GL context isn't safe to touch from a worker thread) and hand the actual HTTP
-    call off to the background thread pool. Returns (future, submit_time, obs_snapshot)
+    call off to the background thread pool. Returns (future, submit_time, obs_snapshot,
+    tick) -- `tick` is the control-tick counter as of this snapshot, so the consumer can
+    tell how much sim time elapsed while the request was in flight and drop that many
+    already-expired actions off the front of the returned chunk (see --replan-at).
     so the caller can log exactly what observation this request was based on."""
     ext_img, wrist_img = render_cameras(renderer, data)
     state = read_state(model, data)
@@ -187,7 +191,7 @@ def capture_and_submit(executor, renderer, data, model, tracked_body_id, server_
         query_server, ext_img, wrist_img, state, server_url,
         send_wrist=send_wrist, timeout=timeout,
     )
-    return future, t0, obs_snapshot
+    return future, t0, obs_snapshot, tick
 
 
 # Every scene's graspable props are freejoint bodies whose world pose lives in qpos -- but the
@@ -353,12 +357,16 @@ def main():
     )
     parser.add_argument(
         "--query-interval",
-        type=float, default=10.0,
+        type=float, default=0.0,
         help=(
-            "minimum seconds between successive model queries (image capture + /act call), "
-            "default 10 -- even if the previous round trip finished faster, the next capture "
-            "waits out the rest of this interval first. 0 disables throttling (fire "
-            "back-to-back, paced only by network/inference latency)."
+            "minimum seconds between successive model queries (image capture + /act call). "
+            "0 (default) disables throttling: fire as soon as the previous chunk is done, "
+            "paced only by inference latency. A positive value sleeps out the remainder of "
+            "the interval first. This used to default to 10, which made sense when each "
+            "chunk advanced the sim only ~32 ms (pre-decimation) -- now a chunk is ~1 s of "
+            "sim time, so a 10 s throttle just adds 9 s of wall-clock nothing between "
+            "chunks. It does NOT distort the physics (the sim is frozen while waiting, so "
+            "the arm doesn't droop), it only makes a run unwatchable in real time."
         ),
     )
     parser.add_argument(
@@ -404,6 +412,22 @@ def main():
         help="seed for --randomize-ball/--randomize-bins' rng, for reproducibility",
     )
     parser.add_argument(
+        "--replan-at",
+        type=int, default=0,
+        help=(
+            "how many actions of the current chunk to execute before firing the NEXT /act "
+            "request. 0 (default) = fire only after the whole chunk has been executed, i.e. "
+            "fully sequential: the sim is frozen while we wait, so the state the model plans "
+            "from is exactly the state we resume from (zero staleness) and the entire chunk "
+            "is used. Any value 1..N-1 fires the request early so inference overlaps chunk "
+            "execution -- that hides wall-clock latency, but sim time advances between the "
+            "snapshot and the reply, so the leading actions of the reply describe motion "
+            "already performed and get dropped (see the note above the loop). Firing earlier "
+            "therefore costs BOTH staleness and usable actions; it only buys wall-clock. "
+            "Kept as a knob to sweep, but 0 is the right default"
+        ),
+    )
+    parser.add_argument(
         "--decimation",
         type=int, default=None,
         help=(
@@ -439,6 +463,10 @@ def main():
         f"sim timestep {model.opt.timestep * 1000:.1f} ms -> holding each action for "
         f"{decimation} steps ({decimation * model.opt.timestep * 1000:.1f} ms, "
         f"{1.0 / (decimation * model.opt.timestep):.2f} Hz control)"
+    )
+    print(
+        "replan: after the full chunk (sequential, zero staleness)" if args.replan_at <= 0
+        else f"replan: after {args.replan_at} action(s) (overlapped; expired actions dropped)"
     )
 
     renderer = mujoco.Renderer(model, height=RENDER_HEIGHT, width=RENDER_WIDTH)
@@ -507,6 +535,10 @@ def main():
     executor = None if args.dry_run else ThreadPoolExecutor(max_workers=1)
     pending = None
     last_query_time = None  # see throttle_query_rate()
+    # Monotonic count of control ticks (= actions actually applied to the sim) since the
+    # run began. Only used to work out how much sim time passed between a request's
+    # observation snapshot and the moment its reply gets consumed -- see --replan-at.
+    tick = 0
 
     with viewer_cm as viewer:
         if not args.no_view:
@@ -521,7 +553,7 @@ def main():
             last_query_time = throttle_query_rate(last_query_time, args.query_interval)
             pending = capture_and_submit(
                 executor, renderer, data, model, tracked_body_id,
-                args.server_url, send_wrist, args.request_timeout,
+                args.server_url, send_wrist, args.request_timeout, tick=tick,
             )
 
         chunk_iter = itertools.count() if args.chunks <= 0 else range(args.chunks)
@@ -552,17 +584,44 @@ def main():
                 round_trip_ms = 1000 * (time.time() - t0)
             else:
                 # `pending` was submitted either before the loop (chunk 0) or after
-                # the first action of the *previous* chunk (see below) -- by the time
-                # we get here it's often already finished, since its ~2s network +
-                # inference round trip has been running in the background while we
-                # stepped through the rest of the previous chunk's actions.
-                future, t0, env_state_before = pending
+                # --replan-at actions of the *previous* chunk (see below). At the
+                # default --replan-at 0 it was fired only once the previous chunk had
+                # fully executed, so nothing has advanced since its snapshot and we
+                # block here for the full inference latency -- the sim is frozen while
+                # we wait, so that costs wall-clock but not physics.
+                future, t0, env_state_before, snapshot_tick = pending
                 actions, dt_ms, request_bytes = future.result()
                 round_trip_ms = 1000 * (time.time() - t0)
 
+            # Drop actions whose control tick has already elapsed. The chunk describes
+            # the `len(actions)` ticks that were supposed to follow `snapshot_tick`; if
+            # the sim has advanced `stale` ticks since then (only possible when
+            # --replan-at fired the request mid-chunk), actions[:stale] describe motion
+            # already performed and applying them would command the arm backwards. This
+            # is safe precisely because the actions are ABSOLUTE joint positions -- the
+            # first action we do keep already encodes the pose (and gripper state) the
+            # arm should be at by then, so nothing is lost by skipping the earlier ones.
+            # With delta actions this truncation would be wrong.
+            stale = 0 if args.dry_run else max(0, tick - snapshot_tick)
+            if stale >= len(actions):
+                # Inference is slower than the whole chunk is long: every action expired
+                # in flight. Keep the last one so the arm still gets a fresh target
+                # rather than none, but this means --replan-at is set too low (or the
+                # server is too slow) for the current horizon.
+                print(
+                    f"  WARNING: all {len(actions)} actions expired in flight "
+                    f"({stale} ticks elapsed) -- keeping only the last. "
+                    f"Raise --replan-at (0 = fully sequential) or shorten latency."
+                )
+                stale = len(actions) - 1
+            if stale:
+                actions = actions[stale:]
+
             print(
                 f"chunk {chunk_i}: got actions{actions.shape} "
-                f"(server dt={dt_ms:.1f}ms, round trip={round_trip_ms:.1f}ms)"
+                f"(server dt={dt_ms:.1f}ms, round trip={round_trip_ms:.1f}ms"
+                + (f", dropped {stale} expired" if stale else "")
+                + ")"
             )
 
             log_entry = {
@@ -570,8 +629,22 @@ def main():
                 "timestamp": time.time(),
                 "env_state": env_state_before,
                 "model_output": {
+                    # NOTE: post-truncation -- the expired leading actions are not here.
+                    # `dropped_expired` says how many the server actually returned on top
+                    # of these.
                     "actions": actions.tolist(),
                     "server_dt_ms": dt_ms,
+                },
+                "timing": {
+                    "decimation": decimation,
+                    "replan_at": args.replan_at,
+                    # Control ticks that elapsed between this chunk's observation snapshot
+                    # and it being applied. 0 at --replan-at 0. This is the staleness of
+                    # the state the model planned from, in ticks -- the quantity to compare
+                    # across a --replan-at sweep.
+                    "staleness_ticks": stale,
+                    "dropped_expired": stale,
+                    "actions_executed": len(actions),
                 },
                 "network": {
                     "url": args.server_url,
@@ -587,6 +660,16 @@ def main():
                 log_f.write(json.dumps(log_entry) + "\n")
                 log_f.flush()
                 continue
+
+            # Which action index to fire the next request after. --replan-at 0 (default)
+            # means "only once the whole chunk is done", which is the last index; any
+            # smaller value fires mid-chunk and overlaps inference with execution, at the
+            # cost of the staleness handled above. Clamped so a --replan-at larger than
+            # this chunk (chunks shrink when actions get dropped) still fires exactly once.
+            fire_after = (
+                len(actions) if args.replan_at <= 0
+                else min(args.replan_at, len(actions))
+            )
 
             for i, action in enumerate(actions):
                 apply_action(data, action)
@@ -606,18 +689,20 @@ def main():
                 Image.fromarray(ext_frame).save(images_dir / f"camera_{ts_ms}_external_cam.png")
                 Image.fromarray(wrist_frame).save(images_dir / f"camera_{ts_ms}_wrist_cam.png")
                 frame_idx += 1
+                tick += 1
 
-                # Fire the next chunk's request right after the first action, using
-                # the state as of *now* (one control tick fresher than the state this
-                # chunk's own request used) -- gives the background request the
-                # rest of this chunk's local stepping/rendering time to complete in.
-                # That budget got 33x larger when decimation landed, so the network
-                # round trip is now much more likely to be fully hidden.
-                if i == 0 and (args.chunks <= 0 or chunk_i + 1 < args.chunks):
+                # Fire the next chunk's request. At --replan-at 0 this lands after the
+                # last action, so the snapshot is the state we will actually resume from
+                # (stale == 0 next iteration) and the whole next chunk is usable. Firing
+                # earlier overlaps inference with the rest of this chunk's stepping, but
+                # every tick executed after the snapshot is one action dropped off the
+                # front of the reply -- so early firing costs both freshness and usable
+                # actions, and buys only wall-clock. See --replan-at.
+                if (i + 1) == fire_after and (args.chunks <= 0 or chunk_i + 1 < args.chunks):
                     last_query_time = throttle_query_rate(last_query_time, args.query_interval)
                     pending = capture_and_submit(
                         executor, renderer, data, model, tracked_body_id,
-                        args.server_url, send_wrist, args.request_timeout,
+                        args.server_url, send_wrist, args.request_timeout, tick=tick,
                     )
 
             print(f"  ctrl after chunk {chunk_i}: {np.array2string(data.ctrl, precision=3, suppress_small=True)}")
