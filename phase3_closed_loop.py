@@ -7,8 +7,10 @@ Every outer iteration:
      MolmoAct2's (8,) state format.
   3. POST {images, instruction, state} to the remote /act endpoint (direct external port,
      no SSH tunnel) -> get back an action chunk, shape (N, 8).
-  4. Apply each of the N actions in turn: set data.ctrl, step physics once, re-render and
-     save the external_cam frame so the episode can be inspected afterward.
+  4. Apply each of the N actions in turn: set data.ctrl, step physics for `decimation`
+     steps (one 15 Hz control tick, matching how phase4_collect_demos.py recorded the
+     training data -- see CONTROL_HZ below), then re-render and save both camera frames
+     so the episode can be inspected afterward.
 
 Usage:
     uv run python phase3_closed_loop.py --dry-run          # just check the server round trip
@@ -73,6 +75,29 @@ GRIPPER_CTRL_MAX = 255.0
 # matches Robotiq's own documented convention for this register (0=open, max=closed),
 # so this number is a real physical constant now, not a guess.
 ROBOTIQ_KNUCKLE_CLOSED_MAX = 0.8  # radians; 0 = open, 0.8 = closed
+
+# MolmoAct2-DROID emits actions at 15 Hz, and phase4_collect_demos.py recorded the
+# training demos at that rate too (its own CONTROL_HZ) -- so one action must be held for
+# 1/15 s of simulated time, not for a single mj_step. The scene's timestep is 0.002 s,
+# so that's decimation = round(500/15) = 33 steps per action.
+#
+# This is load-bearing, and it was wrong here for a long time: the loop below used to
+# call mj_step exactly once per action, giving each command 2 ms instead of 66 ms. The
+# arm is driven by *position* actuators (panda.xml: kp=4500, kd=450, forcerange +/-87),
+# so data.ctrl is a target the joints have to physically travel to, not a teleport. At
+# the torque limit the shoulder needs ~330 ms to settle on a large step and actually
+# moves *backward* for the first ~66 ms (gravity beats the saturated motor), so a 1-step
+# budget meant no command ever made net progress. Worse, it fed back: the arm barely
+# moved -> read_state() barely changed -> the model re-emitted nearly the same absolute
+# joint target -> the arm stayed put. That fixed point is the "reaches near the ball then
+# hovers" behavior seen in every run, base and fine-tuned alike, and it confounded all of
+# them equally.
+#
+# Note the arm does not fully converge within a tick even at 33 steps, and it isn't meant
+# to: the demos were recorded the same way, so both sides settle into the same steady
+# ~12 mm trailing lag behind a smoothly advancing target. Matching collection is the goal
+# here, not convergence. Keep this in sync with phase4_collect_demos.CONTROL_HZ.
+CONTROL_HZ = 15.0
 
 
 def render_cameras(renderer, data):
@@ -378,6 +403,17 @@ def main():
         type=int, default=None,
         help="seed for --randomize-ball/--randomize-bins' rng, for reproducibility",
     )
+    parser.add_argument(
+        "--decimation",
+        type=int, default=None,
+        help=(
+            "physics steps to hold each action for (one control tick). Default: derived "
+            f"from the scene timestep and {CONTROL_HZ:g} Hz, = 33 for a 0.002 s timestep, "
+            "matching phase4_collect_demos.py. Override only to ablate the effect of the "
+            "control rate -- a value below the default is what the pre-fix code did "
+            "implicitly (=1) and it stalls the arm"
+        ),
+    )
     args = parser.parse_args()
     send_wrist = not args.no_wrist_to_model
     model_path = DROID_MODEL_PATH if args.model_path == "droid" else args.model_path
@@ -393,6 +429,18 @@ def main():
         randomize_bins=args.randomize_bins,
         rng=rng,
     )
+    decimation = (
+        args.decimation if args.decimation is not None
+        else int(round((1.0 / model.opt.timestep) / CONTROL_HZ))
+    )
+    if decimation < 1:
+        parser.error("--decimation must be >= 1")
+    print(
+        f"sim timestep {model.opt.timestep * 1000:.1f} ms -> holding each action for "
+        f"{decimation} steps ({decimation * model.opt.timestep * 1000:.1f} ms, "
+        f"{1.0 / (decimation * model.opt.timestep):.2f} Hz control)"
+    )
+
     renderer = mujoco.Renderer(model, height=RENDER_HEIGHT, width=RENDER_WIDTH)
     tracked_body_id = None
     for name in TRACKED_OBJECT_CANDIDATES:
@@ -542,8 +590,14 @@ def main():
 
             for i, action in enumerate(actions):
                 apply_action(data, action)
-                mujoco.mj_step(model, data)
-                viewer.sync()
+                # Hold this action for a full control tick. Syncing the viewer inside the
+                # inner loop (rather than once after it) keeps the on-screen motion smooth
+                # at physics rate instead of stepping 66 ms at a time; rendering/saving
+                # still happens once per action, so the saved frames stay at the same
+                # 15 Hz cadence phase4_collect_demos.py recorded observations at.
+                for _ in range(decimation):
+                    mujoco.mj_step(model, data)
+                    viewer.sync()
                 ext_frame, wrist_frame = render_cameras(renderer, data)
                 # Millisecond epoch timestamp, shared by both cameras' filenames for this
                 # step -- lets you pair external/wrist frames and match them back to a
@@ -554,9 +608,11 @@ def main():
                 frame_idx += 1
 
                 # Fire the next chunk's request right after the first action, using
-                # the state as of *now* (one step fresher than the state this
+                # the state as of *now* (one control tick fresher than the state this
                 # chunk's own request used) -- gives the background request the
                 # rest of this chunk's local stepping/rendering time to complete in.
+                # That budget got 33x larger when decimation landed, so the network
+                # round trip is now much more likely to be fully hidden.
                 if i == 0 and (args.chunks <= 0 or chunk_i + 1 < args.chunks):
                     last_query_time = throttle_query_rate(last_query_time, args.query_interval)
                     pending = capture_and_submit(
