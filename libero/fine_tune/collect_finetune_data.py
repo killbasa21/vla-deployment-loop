@@ -90,12 +90,85 @@ BIN_NAMES = ("green_bin", "blue_bin", "yellow_bin")
 # LIBERO actions have a per-channel std around 0.33, so this is a visible but minority
 # perturbation. The gripper channel is deliberately NOT perturbed: flipping it mid-grasp
 # does not produce a recoverable state, it produces a dropped ball.
-NOISE_SIGMA_POS = 0.15
-NOISE_SIGMA_ROT = 0.04
+#
+# 2026-07-28: 0.15 -> 0.08 (and rot 0.04 -> 0.021, holding the same 0.267 ratio).
+#
+# Sigma is a perturbation on the COMMANDED action, but what actually knocks the arm off
+# the reference is the perturbation that gets REALISED, and the kp x2 / kd x0.7 plant
+# realises 72% of a command where the old one realised 33%. So the identical sigma now
+# delivers well over twice the physical disturbance per tick, and it compounds over all
+# 174 ticks. Measured: at 0.15 on the new plant, 7 of 10 noise slots were DROPPED after
+# exhausting 8 attempts each.
+#
+# Calibrated by running 10 noise episodes per sigma on the new plant:
+#
+#   sigma   placed   q01 of dx     P(slot filled | 8 attempts)
+#   0.05     5/10      -0.052            99.6%
+#   0.07     5/10      -0.085            99.6%
+#   0.08    (chosen, interpolates)
+#   0.09     3/10      -0.116            94%
+#   0.11     0/10      -0.148            ~0
+#   0.15     1/10      -0.215            <1%     <- a1's value
+#
+# The trade is real: a larger sigma buys a more two-sided dx distribution, which is the
+# entire point of the cohort, but past ~0.09 it stops producing keepable episodes. 0.08
+# sits just inside the knee, and --max-attempts-per-episode is raised to 12 to make
+# filling every slot near-certain rather than merely likely.
+NOISE_SIGMA_POS = 0.08
+NOISE_SIGMA_ROT = 0.021
 
 # Recovery cohort.
+#
+# a1's version was ONE kick of 0.85 placed in the first 45% of the episode, and it was too
+# easy: 10/10 episodes were kept on the first attempt, which means the reference tracker
+# absorbed the disturbance without the cohort teaching much. A single kick during the
+# approach has 100+ ticks left to wash out and an empty gripper, so nothing is at stake.
+#
+# a3 kicks TWICE, and the second one is the point: it lands mid-transport with the ball
+# actually in the hand, which is where the observed closed-loop failures live (PROGRESS
+# sec.18 -- grasp achieved, retention not, run degenerates from chunk 5). A loaded kick can
+# genuinely drop the ball, and rejection sampling then throws that episode away, so this
+# costs attempts -- which is the honest sign that the disturbance is doing work now.
+# The loaded kick is smaller (0.6) than the free one deliberately: at 0.85 with a ball in
+# the gripper almost every episode fails and the cohort collects nothing.
 RECOVER_START_JITTER = 0.09   # radians, per joint, on top of LIBERO's reset pose
-RECOVER_KICK = 0.85           # one-tick action-space disturbance, near full scale
+RECOVER_KICK = 0.85           # free-arm disturbance during the approach, near full scale
+RECOVER_KICK_LOADED = 0.60    # smaller: fired mid-transport, with the ball in the gripper
+# Fractions of the episode. Re-derived for a4's longer trajectory (10.8 s vs 7.6 s): the
+# gripper closes at 3.8 s and opens again at 9.2 s, i.e. the arm is LOADED over fraction
+# 0.35-0.85, so the free-arm window has to end before 0.35 and the loaded one has to sit
+# inside it. a3's (0.08, 0.40) would now fire the "free-arm" kick onto a closed gripper.
+RECOVER_KICK_WINDOWS = ((0.06, 0.33), (0.45, 0.78))
+
+# Retreat segments -- the a4 change, and the reason a4 exists.
+#
+# a3's dx channel is ONE-SIDED: q01 = -0.072 against the released dataset's -0.679, i.e.
+# over the whole dataset there is essentially no label that says "move back in -x". That is
+# exactly the correction the closed-loop failures need (README sec.6.5, sec.6.6): the arm
+# overshoots past the ball and never comes back. Noise sigma cannot buy this -- raising it
+# past ~0.09 simply stops episodes from succeeding (sec.4.3) -- so the -x motion has to come
+# from the EXPERT trajectory itself, where it is labelled unconditionally and survives
+# rejection sampling by construction.
+#
+# Two segments are added:
+#   (a) a back-off-and-re-approach inserted between the hover and the descent. The arm
+#       arrives above the ball, withdraws toward the base, then comes back in. This is the
+#       recovery manoeuvre we want the policy to have, demonstrated in the exact visual
+#       context (ball centred, gripper open) where it will need it.
+#   (b) a return to the episode's own start pose after the release, replacing a3's "rise
+#       20 cm and stop". Bins sit at x = 0.56 or 0.80 and the reset pose at x ~ 0.45, so
+#       this is -0.11 to -0.35 m of travel in -x, and it is what a real demonstration would
+#       end with anyway.
+#
+# Sizing: BACKOFF / BACKOFF_SECS is a mean speed of 0.27 m/s, and smoothstep peaks at 1.5x
+# the mean, so ~0.4 m/s -> 0.02 m/tick -> 0.4 action units before servo lag, against a
+# standing droop bias of about +0.10. Comfortably two-sided, comfortably inside the +-1
+# clip. Do not slow this down to be gentle: sec.3.2 shows the label ratio is dt/tau and is
+# INDEPENDENT of reference speed, so a slower retreat produces a smaller label, not a
+# cleaner one.
+RETREAT_BACKOFF = 0.12        # m, withdrawn along -x from the hover pose
+RETREAT_BACKOFF_LIFT = 0.03   # m, and slightly up, so the withdrawal is not a table graze
+RETREAT_BACKOFF_SECS = 0.45   # each way
 
 
 def bin_layout(model, bin_ids, rng):
@@ -139,8 +212,11 @@ def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0):
         mujoco.mj_step(model, data)
 
 
-def waypoints(ball_xy, bin_xy):
+def waypoints(ball_xy, bin_xy, start_pos):
     """The Cartesian reference trajectory, as (grip_site target, gripper, seconds).
+
+    `start_pos` is the arm's ACTUAL settled pose at reset (jittered, for the recover
+    cohort), used as the target of the closing retreat so the episode ends where it began.
 
     Heights are relative to the ball and the table, both of which moved on 2026-07-28 when
     the table was corrected upward by 100 mm -- so they are written in terms of
@@ -162,8 +238,13 @@ def waypoints(ball_xy, bin_xy):
     gx, gy = bin_xy
     ball = np.array([bx, by, BALL_REST_Z])
     over_bin = np.array([gx, gy, L.TABLE_TOP_Z])
+    hover = ball + [0, 0, 0.10]
+    backoff = hover + [-RETREAT_BACKOFF, 0, RETREAT_BACKOFF_LIFT]
     return [
-        (ball + [0, 0, 0.10], OPEN, 1.0),    # 1  hover above the ball, gripper open
+        (hover, OPEN, 1.0),                  # 1  hover above the ball, gripper open
+        (backoff, OPEN, RETREAT_BACKOFF_SECS),  # 1a withdraw toward the base -- see
+        (hover, OPEN, RETREAT_BACKOFF_SECS),    # 1b RETREAT_BACKOFF: the -x labels
+        (hover, OPEN, 0.2),                  # 1c dwell: let the re-approach settle
         (ball, OPEN, 0.8),                   # 2  descend onto it
         (ball, OPEN, 0.3),                   # 3  dwell: let the servo actually arrive
         (ball, CLOSED, 0.6),                 # 4  close, arm holding station
@@ -174,7 +255,8 @@ def waypoints(ball_xy, bin_xy):
         (over_bin + [0, 0, 0.07], CLOSED, 0.8),  # 9  lower to just above the rim
         (over_bin + [0, 0, 0.07], CLOSED, 0.3),  # 10 dwell before letting go
         (over_bin + [0, 0, 0.07], OPEN, 0.5),    # 11 release
-        (over_bin + [0, 0, 0.20], OPEN, 0.6),    # 12 retreat
+        (over_bin + [0, 0, 0.20], OPEN, 0.6),    # 12 rise clear of the bin
+        (np.asarray(start_pos, dtype=float), OPEN, 1.0),  # 13 return to the start pose
     ]
 
 
@@ -195,7 +277,7 @@ def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz):
     track = []
     prev_pos = data.site_xpos[site_id].copy()
     prev_grip = OPEN
-    for target, grip, dur in waypoints(ball_xy, bin_xy):
+    for target, grip, dur in waypoints(ball_xy, bin_xy, prev_pos):
         n = max(1, int(round(dur / dt)))
         for k in range(1, n + 1):
             a = k / n
@@ -238,9 +320,13 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
 
     track = reference_track(model, data, site_id, ball_xy, bin_xy, control_hz)
 
-    # Recovery cohort: one hard shove, somewhere in the approach/descent (the first ~45%
-    # of the episode) so there is time left to recover and still finish.
-    kick_tick = rng.integers(5, max(6, int(0.45 * len(track)))) if cohort == "recover" else -1
+    # Recovery cohort: two shoves, one free-armed during the approach and one loaded
+    # during the transport. See RECOVER_KICK_WINDOWS.
+    kicks = {}
+    if cohort == "recover":
+        for (lo, hi), mag in zip(RECOVER_KICK_WINDOWS, (RECOVER_KICK, RECOVER_KICK_LOADED)):
+            t = int(rng.integers(max(1, int(lo * len(track))), max(2, int(hi * len(track)))))
+            kicks[t] = mag
 
     frames = {"image": [], "wrist_image": []}
     states, actions = [], []
@@ -262,9 +348,9 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
         if cohort == "noise":
             executed[0:3] += rng.normal(0.0, NOISE_SIGMA_POS, size=3)
             executed[3:6] += rng.normal(0.0, NOISE_SIGMA_ROT, size=3)
-        elif tick == kick_tick:
+        elif tick in kicks:
             direction = rng.normal(size=3)
-            executed[0:3] += RECOVER_KICK * direction / np.linalg.norm(direction)
+            executed[0:3] += kicks[tick] * direction / np.linalg.norm(direction)
         executed = np.clip(executed, -1.0, 1.0)
 
         _, _, was_clamped = L.apply_action(model, data, scratch, executed, site_id)
@@ -284,7 +370,7 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
         "ball_max_z": max_ball_z,
         "table_clamped_ticks": clamped_ticks,
         "ticks": len(track),
-        "kick_tick": int(kick_tick),
+        "kick_ticks": sorted(int(t) for t in kicks),
         "ball_xy": [float(ball_xy[0]), float(ball_xy[1])],
         "bin_xy": [float(bin_xy[0]), float(bin_xy[1])],
     }
@@ -294,12 +380,19 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
 def selftest(model, data, site_id):
     """Print the frame checks that the 2026-07-28 scene corrections were made against.
     Cheap regression guard: if someone re-edits the scene, these move."""
-    data.qpos[:7] = L.LIBERO_INIT_QPOS
-    data.ctrl[L.ARM] = L.LIBERO_INIT_QPOS
-    data.ctrl[7] = L.GRIPPER_CTRL_MAX
-    mujoco.mj_forward(model, data)
-    for _ in range(200):
-        mujoco.mj_step(model, data)
+    # Go through reset_episode rather than setting qpos[:7] by hand, so this guard reports
+    # the state an episode actually starts from (objects placed, arm settled) rather than a
+    # near-identical but not identical hand-rolled one. Measured: both paths converge by 50
+    # steps and agree to <0.1 mm here, so this is about the guard being the real thing, not
+    # about a bug it was hiding.
+    #
+    # What this number is NOT: `0.2728` appears in libero/README.md and fine_tune/README.md
+    # as "ours" against LIBERO's 0.2733, i.e. a claimed 0.5 mm match. 0.2728 is the PURE
+    # FORWARD KINEMATICS of LIBERO_INIT_QPOS with no dynamics. The settled pose the arm
+    # actually holds is lower, because the position servo sags under gravity: 0.2680 on
+    # menagerie's stock gains (4.84 mm of sag, so a 5.3 mm error against LIBERO, not
+    # 0.5 mm), and 0.2704 on the kp x2 / kd x0.7 gains this file now runs (2.44 mm).
+    reset_episode(model, data, np.random.default_rng(0), (0.56, 0.0))
     state = L.read_state(model, data, site_id, _finger_adr(model))
     tg = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_geom")
     top = model.geom_size[tg][2] + data.geom_xpos[tg][2]

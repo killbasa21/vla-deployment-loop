@@ -406,14 +406,34 @@ def apply_action(model, data, scratch, action, site_id):
     return reached, float(np.linalg.norm(dpos)), clamped
 
 
-def query_server(main_img, wrist_img, state, server_url, send_wrist=True, timeout=30):
-    """The payload keys stay "external_cam"/"wrist_cam" because that is what
-    host_server_droid.py's schema demands -- they are positional, forwarded as
-    images=[first, second], so the first is LIBERO's agentview and the second its
-    eye-in-hand. Nothing DROID-specific survives past the key names."""
+# Which payload keys carry the two camera frames. This is NOT cosmetic -- it decides
+# which server can read the request at all:
+#
+#   "droid"  -> host_server_droid.py (libero_modal.py, serving the released checkpoint)
+#              reads payload["external_cam"] / payload["wrist_cam"] by name and forwards
+#              them positionally as images=[first, second]. Nothing DROID-specific
+#              survives past the key names.
+#   "libero" -> scripts/serve_policy.py (libero_modal_finetuned.py, serving our
+#              fine-tune) looks up IMAGE_KEY_PRESETS["libero"] = ["image", "wrist_image"]
+#              and turns the key it found into the feature name
+#              `observation.images.<key>` fed to the model. Send external_cam to that
+#              server and it finds no images at all.
+#
+# Both servers ignore keys they do not know, so sending all four would work -- at the
+# cost of doubling a payload that is already ~4x the inference cost (PROGRESS sec.2).
+PAYLOAD_KEY_SETS = {
+    "droid": ("external_cam", "wrist_cam"),
+    "libero": ("image", "wrist_image"),
+}
+
+
+def query_server(main_img, wrist_img, state, server_url, send_wrist=True, timeout=30,
+                 payload_keys="droid"):
+    """POST one observation and return (actions, server_dt_ms, request_bytes)."""
+    main_key, wrist_key = PAYLOAD_KEY_SETS[payload_keys]
     payload = {
-        "external_cam": main_img,
-        "wrist_cam": wrist_img if send_wrist else np.zeros_like(wrist_img),
+        main_key: main_img,
+        wrist_key: wrist_img if send_wrist else np.zeros_like(wrist_img),
         "instruction": INSTRUCTION,
         "state": state,
     }
@@ -434,7 +454,8 @@ def query_server(main_img, wrist_img, state, server_url, send_wrist=True, timeou
 
 
 def capture_and_submit(executor, renderer, data, model, site_id, finger_qposadr,
-                       tracked_body_id, server_url, send_wrist, timeout, flip, tick=0):
+                       tracked_body_id, server_url, send_wrist, timeout, flip, tick=0,
+                       payload_keys="droid"):
     """Render + read state on the main thread (mujoco.Renderer's GL context is not
     thread-safe), hand the HTTP call to the worker. Returns
     (future, submit_time, obs_snapshot, tick)."""
@@ -453,7 +474,7 @@ def capture_and_submit(executor, renderer, data, model, site_id, finger_qposadr,
     t0 = time.time()
     future = executor.submit(
         query_server, main_img, wrist_img, state, server_url,
-        send_wrist=send_wrist, timeout=timeout,
+        send_wrist=send_wrist, timeout=timeout, payload_keys=payload_keys,
     )
     return future, t0, obs_snapshot, tick
 
@@ -579,6 +600,17 @@ def main():
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--randomize-ball", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--payload-keys", choices=tuple(PAYLOAD_KEY_SETS), default="droid",
+        help=(
+            "which keys carry the camera frames in the /act request. `droid` "
+            "(external_cam/wrist_cam) for a host_server_droid.py deployment, i.e. "
+            "libero_modal.py serving the released checkpoint. `libero` "
+            "(image/wrist_image) for a scripts/serve_policy.py deployment, i.e. "
+            "libero_modal_finetuned.py serving our fine-tune -- that server derives the "
+            "model's feature names from these keys and sees NO images if they are wrong"
+        ),
+    )
     parser.add_argument(
         "--image-flip", choices=("none", "180", "vertical"), default="none",
         help=(
@@ -729,7 +761,7 @@ def main():
             pending = capture_and_submit(
                 executor, renderer, data, model, site_id, finger_qposadr,
                 tracked_body_id, args.server_url, send_wrist, args.request_timeout,
-                args.image_flip, tick=tick,
+                args.image_flip, tick=tick, payload_keys=args.payload_keys,
             )
 
         chunk_iter = itertools.count() if args.chunks <= 0 else range(args.chunks)
@@ -756,6 +788,7 @@ def main():
                 actions, dt_ms, request_bytes = query_server(
                     main_img, wrist_img, state, args.server_url,
                     send_wrist=send_wrist, timeout=args.request_timeout,
+                    payload_keys=args.payload_keys,
                 )
                 round_trip_ms = 1000 * (time.time() - t0)
                 snapshot_tick = tick
@@ -860,6 +893,7 @@ def main():
                         executor, renderer, data, model, site_id, finger_qposadr,
                         tracked_body_id, args.server_url, send_wrist,
                         args.request_timeout, args.image_flip, tick=tick,
+                        payload_keys=args.payload_keys,
                     )
 
             eef = data.site_xpos[site_id]
