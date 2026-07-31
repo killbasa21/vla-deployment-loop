@@ -937,6 +937,152 @@ layout `info.json` misnames, and why `--image-flip none` is correct).
 
 ---
 
+## 22. Route A removed: native OSC, and the arm gains found reverted
+
+**Tried.** Every entry from §11 onward carries the same caveat — Route A (solve IK, command
+joint positions) is a stand-in for the operational-space controller LIBERO actually uses, and
+§20 left "which side of our scene is at fault" open precisely because it changed controller
+and task together. Rather than run the isolating diagnostic first, the controller was
+replaced outright.
+
+**What `ctrl` actually is, which is where the confusion lived.** `data.ctrl` is MuJoCo's
+actuator input vector; what a number in it *means* is set by the actuator type:
+
+| | robosuite/LIBERO | ours (before) |
+|---|---|---|
+| declaration | `<motor ctrlrange="-80 80">` | `<general biastype="affine" gainprm="4500">` |
+| `ctrl[0:7]` is | **torque, N.m** | **joint angle, rad** |
+| set by | OSC: `tau = J^T Lambda F + qfrc_bias + nullspace` | DLS IK solution |
+
+So LIBERO never commanded joint angles. The policy's 7-D delta is not "an OSC thing" either
+— it is embodiment-independent by design, and the controller under it is an implementation
+detail the model never sees. That is what made swapping it legitimate.
+
+**Built.**
+
+| file | what |
+|---|---|
+| `mujoco_menagerie/.../panda_libero_osc.xml` | `panda_libero_hand.xml` + torque `<motor>` arm actuators (ADDITION 7), zeroed arm entries in the home keyframe |
+| `mujoco_menagerie/.../scene_libero_osc.xml` | `scene_libero_hand.xml` with that include swapped; everything else byte-identical |
+| `libero/osc_controller.py` | port of robosuite **1.4.0**'s `OSC_POSE` (the version LIBERO pins — 1.5.2 has an `input_ref_frame` that 1.4.0 lacks and we must not introduce) |
+| `libero/tools/verify_osc.py` | four standalone checks, all CPU |
+| `libero/libero_closed_loop.py` | `--control-mode {osc,ik}`, default **osc** |
+
+**The timing detail that would have been a silent bug.** robosuite does *not* compute one
+torque per policy action and hold it. `environments/base.py:454` loops
+`control_timestep/model_timestep` times calling the controller **every physics step**, with
+`policy_step=True` only on the first — so `set_goal` fires at 20 Hz and the PD runs at
+500 Hz. Holding one torque across a 25-step tick is a different, unstable controller: the
+damping term goes blind to the velocity it exists to damp. The stepping loop had to be
+restructured for this; IK mode's write-once-then-step is correct only because it commands an
+absolute joint target.
+
+**Measured (`verify_osc.py`, all four pass):**
+
+```
+[1] velocity convention   J@qvel vs mj_objectVelocity   max|diff| 1e-16    PASS
+[2] station keeping       sag 0.000 mm  (position servo: 4.84 mm stock, 2.44 stiffened)
+                          settled eef above table 0.2728 vs LIBERO 0.2733
+[3] step response         12.3% realised per tick; analytic 1-(1+wn*t)e^-wn*t = 12.6%
+[4] contact compliance    120 ticks driving down: -1.11 mm at 35.4 N, rests +14.7 mm
+                          above the table   (position servo: -2.9 mm at ~70 N, sec.19)
+```
+
+Three things this closes:
+
+- **Droop is gone, exactly.** Sag is 1e-16, not "small". README.md is *entirely* about a bug
+  that only exists because an overdamped position servo never arrives — the collector's
+  `(target - current)` label carried that sag into every frame. A torque controller has no
+  joint setpoint to lag behind. It also incidentally makes README §1.1's documentation error
+  moot: the claimed "0.2728 vs 0.2733, 0.5 mm" was a *pure-FK* number compared against a
+  dynamic one, and the settled pose really was 0.2680. Under OSC the settled pose **is** the
+  FK pose, so the claim is now true.
+- **Compliance is native**, so `--min-clearance` defaults to OFF in osc mode. It was always a
+  departure from LIBERO's control law, and `libero/README.md` already suspected it cost more
+  than it bought.
+- **`IK unreached` cannot happen.** `opspace_matrices` uses `pinv`, so near a singularity the
+  wrench degrades smoothly. Replaced in the logs by a torque-saturation counter.
+
+**One number that is NOT an improvement, and must not be "fixed".** OSC realises **12.3%** of
+a commanded delta per tick against the position servo's ~33%. That is correct: it matches the
+analytic critically-damped step response at `wn = sqrt(150)` to 0.3 points, and the policy was
+trained through exactly this response. A value near 100% would mean the port is **wrong**. My
+own pre-measurement guess of "~45%" was wrong, and the analytic check is what caught it —
+"does it move a plausible amount" is not falsifiable.
+
+**Smoke test, fake server, identical scripted actions through both modes:**
+
+```
+        chunk0 eef_z   chunk1   chunk2   chunk3   clamped
+osc        0.187       0.108    0.029    0.003    none
+ik         0.121       0.005    0.003    0.003    3/10, 10/10, 10/10
+```
+
+Route A slams down and then spends every remaining action against the clamp — the pathology
+`libero/README.md` flagged from `stockhand_03`. OSC descends smoothly and never clamps. This
+is a scripted-action smoke test, **not** evidence about the policy.
+
+**A measurement error found on the way, and it is not mine this time.**
+`panda_libero_hand.xml`'s ADDITION 6 documents the `kp x2, kd x0.7` stiffening at length, and
+README §4.1 records it as landed — but the **compiled model reports menagerie's stock 4500/450**.
+The actuator lines were reverted at 17:11 on 2026-07-28 while the comment was left in place;
+nothing applies gains in Python (grepped). The file is **untracked** inside the gitignored
+`mujoco_menagerie` submodule, so the edit never had version control and there is no history
+to date it against. Timeline: `a3` 04:24, `a4` 14:27, `ft150` eval 15:18, revert 17:11 — the
+datasets and the eval predate it. Moot for OSC (no arm position gains exist there), but it
+means an IK-vs-OSC comparison run *today* is against a stock-gain Route A. Verified by
+compiling the model and reading `actuator_gainprm`, not by reading the XML — which is now the
+standing rule for this directory.
+
+### 22.1 First inference on the OSC path (`osc_molmoact_01`)
+
+12 chunks against the deployed stock `allenai/MolmoAct2-LIBERO` (L4, `GET /act` confirmed
+`norm_tag: libero`, `repo_id: allenai/MolmoAct2-LIBERO`). Default settings, so
+`--min-clearance` OFF. Server dt ~715 ms, round trip ~3.0-4.0 s warm (first call 37.9 s, cold).
+
+```
+ ch  eef_z_mm  ball_moved  ball_z_mm  grip%   sat  clamp
+  0     249.6         0.0       20.0      0     0      0
+  3      66.7         0.0       20.0      0     0      0
+  4      14.8         0.0       20.0      0     0      0
+  5      17.2         7.6       19.9     80     0      0
+  6      50.2        47.6       20.0    100     0      0
+  8      14.8        96.9       19.8      0     0      0
+ 11      15.4       103.0       20.0      0     0      0
+```
+
+**The mechanical pathologies are gone.** Zero table-clamped ticks and zero torque saturation
+across all 120 control ticks, *with the clamp disabled* — the arm descends to ~15 mm above the
+table and arrests there on its own. Compare §17-19, where the eef drove through the surface
+and then dragged across it, and README §9, where two of three runs ended at `IK unreached
+10/10` with 444 mm and 229 mm of lateral divergence. None of that happens here. Best lateral
+approach **8.1 mm**, against 44.9 / 7.2 / 32.6 mm for the three Route A runs.
+
+**The task still fails.** `ball_z` never leaves 20.0 mm: no lift, no placement. The ball is
+shoved 103 mm laterally instead. Gripper closes on 25.8% of actions overall and commits
+properly in chunks 5-6 (80%, 100%), so this is not the "never closes" failure of §15 — it is
+the *closes beside the ball* failure. `grip_site` arrests at 14.8 mm with the pad centre
+3.6 mm behind it, i.e. pads at ~18.4 mm against a ball centre at 20 mm — about **1.6 mm below
+the equator**, down from §17's ~7 mm, and still the wrong side of it.
+
+Rotation channel std is healthy (drx/dry/drz = 0.016 / 0.040 / 0.017 against released LIBERO's
+0.039 / 0.063 / 0.078), so the stock checkpoint is not collapsed — as expected, it is stock.
+
+**This is ONE run and the policy samples** (§18). It is not evidence of a rate, and it is not
+evidence that OSC beats Route A on task success. What it does establish is that the OSC path
+runs end to end against the real checkpoint, and that the contact/IK/clamp failure modes which
+confounded §12-§19 are absent rather than merely smaller. Scoring the two controllers against
+each other needs N runs each through `score_runs.py`.
+
+**Consequence for the datasets, and it is not small.** `a3`/`a4` were collected through
+`apply_action`, i.e. Route A, and the collector's design rule is that labels are produced by
+the controller that will consume them. Training on them and serving through OSC breaks that
+rule. They need regenerating against OSC — free CPU time, but `NOISE_SIGMA_POS` in particular
+must be **re-calibrated**, not carried over: it was cut 0.15 -> 0.08 *because* a stiffer plant
+realised more of each perturbation, and OSC's per-tick response is different again.
+
+---
+
 ## Corrections to `PHASE5_PLAN.md`
 
 Things the plan asserts that later measurement contradicted:
@@ -968,9 +1114,13 @@ Things the plan asserts that later measurement contradicted:
   correct. The benchmark driver rotates both cameras 180° and scores 3/3 on a real task.
   §14's contrary result came from scoring on lateral distance in a scene where nothing
   ever grasps.
-- **Which side of our scene is at fault is still open.** §20 proves the fault is ours, not
-  the checkpoint's, but changed controller and task together. Next run to settle it: Route
-  A driving a LIBERO task.
+- **Which side of our scene is at fault is still open**, and §22 changed how to settle it.
+  §20 proved the fault is ours rather than the checkpoint's, but changed controller *and*
+  task together. The proposed isolating run was "Route A driving a LIBERO task" — that
+  question is now largely retired, since the controller under test *is* OSC. The remaining
+  form is: **OSC on our green-ball scene**. If it still fails where `libero_benchmark_eval.py`
+  scores 3/3, the controller was never the blocker and the scene/task is simply out of
+  distribution, which points squarely at the fine-tune.
 - ~~Wrist camera pose is our own design~~ **RESOLVED in §16**: replaced with robosuite's
   `eye_in_hand`, copied verbatim.
 - ~~Pad friction 0.7/0.6 vs 2.0~~ **RESOLVED in §16**: the stock hand carries robosuite's
@@ -981,8 +1131,23 @@ Things the plan asserts that later measurement contradicted:
   v3.0 schema, but nothing has loaded them through `LeRobotDataset` and no training run has
   used them. Also unresolved: the released dataset declares `fps: 10` while LIBERO's env
   and our loop both run at 20 Hz — `a2` exists to test that.
-- ~~Route A is not OSC — no compliance~~ **DEMOTED by §15**: measured hardware penetration
-  is 0.1–0.5 mm with actuators unsaturated, so this is not the blocker it was thought to
-  be. `--control-mode` hook still not built.
+- ~~Route A is not OSC — no compliance~~ ~~**DEMOTED by §15**~~ **RESOLVED in §22**:
+  `--control-mode osc` runs a port of robosuite 1.4.0's `OSC_POSE` on torque actuators.
+  Sag 0.000 mm, penetration −1.11 mm at 35.4 N, no `IK unreached`. Not yet run against
+  the model.
+- ~~The OSC path has never seen inference~~ **DONE, §22.1**: 12 chunks against the stock
+  checkpoint. No clamping, no saturation, no IK failures, best lateral 8.1 mm — and still
+  0/1 on lift and placement. **The open item is now the RATE**: N runs of osc vs ik through
+  `score_runs.py`, against README §9's 0/3 placed, 1/3 lifted. One run is one draw.
+- **The grasp closes ~1.6 mm below the ball's equator** (§22.1), down from ~7 mm. That is
+  the remaining mechanical gap between "shoves the ball" and "lifts it", and it is now
+  small enough to be worth a deliberate sweep of where the eef arrests.
+- **`a3`/`a4` are controller-mismatched** (§22). Collected through Route A, but the client
+  now serves through OSC, breaking the collector's one design rule. Regenerate against OSC
+  and **re-calibrate `NOISE_SIGMA_POS`** rather than reusing 0.08.
+- **The arm gains in `panda_libero_hand.xml` are stock, not stiffened** (§22), contrary to
+  its own comment and top-level README §4.1. Untracked file in a gitignored submodule, so
+  no history. Decide whether the stiffening should be restored for the `ik` path, or
+  whether that path is now purely a reproducibility fallback and should stay as-is.
 - Transport is ~4× inference cost (§2). Encode frames before POSTing. With the drop to an
   L4 this is now, even more clearly, the only latency worth optimising.

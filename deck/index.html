@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Green-ball pick &amp; place — VLA in MuJoCo</title>
+<style>
+:root{
+  --bg:#0d1117; --panel:#161b22; --fg:#e6edf3; --dim:#8b949e;
+  --acc:#58a6ff; --good:#3fb950; --bad:#f85149; --warn:#d29922;
+  --line:#30363d;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+  font:16px/1.5 -apple-system,"Segoe UI",Inter,system-ui,sans-serif}
+#deck{height:100%}
+section{display:none;height:100%;padding:3.2vh 5vw 7vh;flex-direction:column}
+section.on{display:flex}
+h1{font-size:3.4vw;margin:0 0 1vh;line-height:1.15}
+h2{font-size:2.3vw;margin:0 0 .4vh;line-height:1.2}
+h2 .num{color:var(--acc);font-variant-numeric:tabular-nums;margin-right:.5em}
+.sub{color:var(--dim);font-size:1.15vw;margin:0 0 2.2vh}
+ul{margin:0 0 1.4vh;padding-left:1.1em}
+li{margin:.55vh 0;font-size:1.22vw}
+li b{color:var(--fg)}
+li .k{color:var(--acc)}
+code{background:#1f2630;padding:.08em .35em;border-radius:4px;font-size:.92em;
+  font-family:ui-monospace,"SF Mono",Menlo,monospace;color:#c9d1d9}
+.cols{display:flex;gap:2.2vw;flex:1;min-height:0}
+.cols>*{flex:1;min-width:0}
+table{border-collapse:collapse;width:100%;font-size:1.05vw}
+th,td{border-bottom:1px solid var(--line);padding:.55vh .7vw;text-align:left}
+th{color:var(--dim);font-weight:600;font-size:.95vw;text-transform:uppercase;letter-spacing:.04em}
+td.n{font-variant-numeric:tabular-nums}
+.good{color:var(--good)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+figure{margin:0;display:flex;flex-direction:column;gap:.7vh;min-height:0}
+figure img{width:100%;object-fit:contain;border:1px solid var(--line);border-radius:8px;background:#fff;min-height:0}
+figcaption{color:var(--dim);font-size:.95vw}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1.4vh 1.2vw}
+.card h3{margin:0 0 .6vh;font-size:1.15vw;color:var(--acc)}
+.big{font-size:2.6vw;font-weight:700;font-variant-numeric:tabular-nums}
+.row{display:flex;gap:1.2vw;margin-bottom:1.4vh}
+.row>*{flex:1}
+.tag{display:inline-block;background:#1f6feb22;border:1px solid #1f6feb66;color:var(--acc);
+  border-radius:999px;padding:.15em .8em;font-size:.95vw;margin-bottom:1.4vh}
+pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:1vh 1vw;font-size:1vw;overflow:auto;margin:0 0 1.2vh;
+  font-family:ui-monospace,Menlo,monospace}
+.note{color:var(--dim);font-size:1.02vw;border-left:3px solid var(--acc);padding-left:.8vw;margin-top:auto}
+footer{position:fixed;bottom:1.4vh;left:5vw;right:5vw;display:flex;justify-content:space-between;
+  color:var(--dim);font-size:.9vw;border-top:1px solid var(--line);padding-top:.7vh}
+.flow{display:flex;align-items:center;gap:.7vw;flex-wrap:wrap;font-size:1.1vw}
+.flow .b{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.8vh 1vw}
+.flow .a{color:var(--acc)}
+.title-wrap{justify-content:center}
+.title-wrap .meta{color:var(--dim);font-size:1.2vw;margin-top:2vh}
+</style>
+</head>
+<body>
+<div id="deck">
+
+<!-- 1 -->
+<section class="on title-wrap">
+  <div class="tag">MuJoCo · Franka Panda · vision-language-action policies</div>
+  <h1>Teaching a VLA to pick up a green ball</h1>
+  <p class="sub" style="font-size:1.5vw">Three checkpoints, one sim, and everything that had to match
+  before the model could do anything at all.</p>
+  <div class="row" style="margin-top:3vh">
+    <div class="card"><h3>Act I</h3><div class="big">MolmoAct2-DROID</div>
+      <div class="sub" style="margin:0">real-robot pretraining · wrong domain</div></div>
+    <div class="card"><h3>Act II</h3><div class="big">MolmoAct2-LIBERO</div>
+      <div class="sub" style="margin:0">5.6B · right sim · too costly to fine-tune</div></div>
+    <div class="card"><h3>Act III</h3><div class="big">SmolVLA-LIBERO</div>
+      <div class="sub" style="margin:0">450M · fine-tuned · lifts the ball</div></div>
+  </div>
+  <p class="meta">Closed-loop client in MuJoCo ↔ policy served on a rented Modal GPU over HTTP <code>/act</code>.</p>
+</section>
+
+<!-- 2 -->
+<section>
+  <h2><span class="num">00</span>The problem</h2>
+  <p class="sub">Can an off-the-shelf vision-language-action model drive <i>our</i> robot, in <i>our</i> simulator, on a task it has never seen?</p>
+  <div class="cols">
+    <div>
+      <p style="font-size:1.3vw;margin:0 0 1.2vh"><b>The task:</b> a Franka Panda in MuJoCo must
+      <b>pick up a green ball and place it in the green container</b> — from a natural-language
+      instruction and two camera images alone. Ball position and bin layout are randomised every
+      episode, so nothing can be memorised.</p>
+      <p style="font-size:1.15vw;margin:0 0 .8vh"><b>Why it is hard:</b></p>
+      <ul>
+        <li><b>No task-specific model exists.</b> Every VLA checkpoint was trained on some
+          <i>other</i> robot, camera, controller and object set.</li>
+        <li><b>Everything is a contract.</b> Action units, control rate, coordinate origin, camera
+          pose, gripper sign — mismatch any one and the model returns plausible-looking nonsense
+          <i>without erroring</i>.</li>
+        <li><b>No teleoperation rig.</b> Any fine-tuning data has to be generated by the sim itself.</li>
+        <li><b>GPUs cost money per experiment.</b> Every rollout and every training step is rented.</li>
+      </ul>
+      <p style="font-size:1.15vw;margin-top:1.2vh"><b>The question we were really answering:</b>
+      when the robot fails — is it the model, the scene, or the loop?</p>
+      <p class="note">Success is defined mechanically, not by eye: <b>lift</b> = ball leaves the table;
+      <b>place</b> = ball ends inside the green bin within ±50&nbsp;mm. Scored from the run logs.</p>
+    </div>
+    <figure>
+      <img src="img/molmoact_osc.png" alt="task rollout">
+      <figcaption>The task, one rollout: approach, descend, close, and — the hard part — leave with the ball.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- 3 -->
+<section>
+  <h2><span class="num">01</span>The setup</h2>
+  <p class="sub">Same loop the whole way through — only the checkpoint behind <code>/act</code> changes.</p>
+  <div class="flow" style="margin-bottom:2.4vh">
+    <span class="b">MuJoCo Panda<br><small style="color:var(--dim)">2 cams + proprio</small></span>
+    <span class="a">──POST /act──▶</span>
+    <span class="b">Modal GPU<br><small style="color:var(--dim)">VLA policy</small></span>
+    <span class="a">──action chunk──▶</span>
+    <span class="b">controller<br><small style="color:var(--dim)">OSC / IK</small></span>
+    <span class="a">──▶</span>
+    <span class="b">physics<br><small style="color:var(--dim)">500&nbsp;Hz</small></span>
+  </div>
+  <div class="cols">
+    <div>
+      <ul>
+        <li><b>Task:</b> "pick up the green ball and put it in the green container", ball position randomised.</li>
+        <li><b>Observation:</b> external cam + wrist cam @256², end-effector pose + gripper state.</li>
+        <li><b>Action:</b> a <b>chunk</b> of 10–15 future steps per inference call, executed open-loop, then replan.</li>
+        <li><b>Every run logs</b> JSONL + every rendered frame — so failures are measurable, not anecdotal.</li>
+      </ul>
+      <p class="note">Everything that follows is one repeated lesson: the policy is fine, the <i>environment contract</i> is what breaks.</p>
+    </div>
+    <figure>
+      <img src="img/panda_scene_3q.png" alt="Franka Panda on pedestal over the table" style="flex:1">
+      <img src="img/panda_cams.png" alt="external and wrist camera views" style="flex:0 0 auto;max-height:22vh">
+      <figcaption>The actual arm: Franka Panda + stock Franka hand, on a 0.912&nbsp;m pedestal over the table
+      (LIBERO's own mount). Below — what the model receives each step: external cam (left), wrist cam (right), 256² each.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- 3 -->
+<section>
+  <h2><span class="num">02</span>Act I — MolmoAct2-DROID, and why it never had a chance</h2>
+  <p class="sub">Pretrained on <b>real camera footage of a real FR3 arm</b>. Not a simulator, not our robot.</p>
+  <div class="cols">
+    <div>
+      <ul>
+        <li>Domain gap on <b>both</b> ends: photoreal RGB vs MuJoCo render, FR3 vs Panda.</li>
+        <li>Action convention: 8-D <b>absolute joint pose</b> in raw radians, 15 Hz.</li>
+        <li>Behaviour: arm drifts near the ball, never grasps. Ball never moves a millimetre.</li>
+        <li><b>But the model was not the only thing failing</b> — and we could not tell, because
+          the loop itself was discarding ~97% of every command (next slide).</li>
+      </ul>
+      <p style="font-size:1.15vw;margin:.6vh 0 .4vh"><b>How we found out — "oracle replay":</b> take the
+      <b>scripted expert's</b> action sequence (the one that puts the ball in the bin every time during
+      collection) and feed it through the inference loop <b>in place of the model</b>. Same start state,
+      same execution path, same scoring — only the action <i>source</i> changes.</p>
+      <pre>normal   sim state ─▶ POST /act ─▶ <b>model</b> ─▶ chunk ─▶ apply_action ─▶ mj_step xN
+replay   sim state ────────────▶ <b>recorded expert actions</b> ─▶ apply_action ─▶ mj_step xN</pre>
+      <p class="note">Free — local CPU, no GPU, seconds per run. And decisive: if actions with a
+      <b>proven 100% success rate</b> score zero, the bug is downstream of the policy.</p>
+    </div>
+    <figure>
+      <img src="img/droid_gif_run2_external_cam.gif" alt="DROID run">
+      <figcaption>MolmoAct2-DROID on the original floor scene.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- 4 -->
+<section>
+  <h2><span class="num">03</span>Fix 1 — decimation: we were running the arm 33× too fast</h2>
+  <p class="sub">One <code>mj_step</code> per action — but a policy action is not one physics step.</p>
+  <div class="cols">
+    <div>
+      <pre>MuJoCo timestep       0.002 s   ->  one mj_step = <b>2 ms</b> of physics
+DROID  policy 15 Hz             ->  hold each action <b>66 ms = 33 steps</b>
+LIBERO policy 20 Hz             ->  hold each action <b>50 ms = 25 steps</b>
+old loop: 1 step per action     ->  <b class="bad">2 ms = 3% of the required hold</b></pre>
+      <table>
+        <tr><th>path</th><th>final ball pos</th><th>in bin?</th></tr>
+        <tr><td>1 step / action (old)</td><td class="n">untouched from spawn</td><td class="bad">✗</td></tr>
+        <tr><td>33 steps (decimation fix)</td><td class="n">(0.682, −0.026)</td><td class="good">✓</td></tr>
+      </table>
+      <p style="font-size:1.15vw;margin:1.6vh 0 .8vh"><b>Actions with a proven 100% success rate scored zero
+      through the old path.</b> So every earlier evaluation — base model and both fine-tunes — had a
+      <b>ceiling of zero</b>. They all looked identical because the env discarded ~97% of every command,
+      whatever the policy said. Those runs measured the bug, not the models.</p>
+      <pre>held  33 steps ( 66 ms): joint2 −9%  &lt;- moving BACKWARD, gravity beats saturated motor
+held 165 steps (330 ms): 88%
+held 500 steps (1.00 s): 95%   (settling takes ~330 ms, not 66)</pre>
+      <p class="note"><b>Learning:</b> control rate is part of the model's contract. The policy's Hz decides
+      how long each action is held — 15&nbsp;Hz → 33 steps, 20&nbsp;Hz → 25 steps. It is not a convergence
+      target: the arm tracks a <i>ramp</i> with a steady ~12&nbsp;mm lag, exactly as in collection.</p>
+    </div>
+    <figure>
+      <img src="img/decimation_fix.gif" alt="decimation before and after">
+      <figcaption><b>Before (left) vs after (right).</b> This is about <i>motion</i>, not success — the arm now
+      traverses smoothly instead of twitching in place. It still does not pick the ball up; that came much later.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- 5 -->
+<section>
+  <h2><span class="num">04</span>Fix 2 — <code>--replan-at</code>: when to ask for the next chunk</h2>
+  <p class="sub">Fire the next request mid-chunk for freshness, or after it for completeness?</p>
+  <div class="cols">
+    <div>
+      <table>
+        <tr><th>fire after action <i>f</i></th><th>staleness (ticks)</th><th>actions actually used</th></tr>
+        <tr><td class="n">1</td><td class="n">7</td><td class="n">8 / 15</td></tr>
+        <tr><td class="n">5</td><td class="n">5</td><td class="n">10 / 15</td></tr>
+        <tr><td class="n">13</td><td class="n">1</td><td class="n">14 / 15</td></tr>
+        <tr><td class="n"><b>0 (sequential)</b></td><td class="n good"><b>0</b></td><td class="n good"><b>15 / 15</b></td></tr>
+      </table>
+      <ul style="margin-top:1.4vh">
+        <li>Early firing costs freshness <b>and</b> usable actions — it only buys wall-clock.</li>
+        <li>The sim is <b>frozen</b> while waiting, so wall-clock is physically free.</li>
+        <li>With <b>delta</b> actions (LIBERO), dropping expired actions loses displacement — sequential is the only safe mode.</li>
+      </ul>
+      <p style="font-size:1.15vw"><b>Bonus:</b> sequential mode made latency legible for the first time.</p>
+      <pre>server dt (inference):  1394 ms
+round trip:             6845 ms
+unaccounted:            5451 ms  &lt;- ~4x inference: raw 1.14 MB JSON arrays</pre>
+      <p class="note">Decimation + sequential replanning together are what made runs look <b>real-time</b> and
+      watchable instead of a twitching arm and 9&nbsp;s of dead air per chunk.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 6 -->
+<section>
+  <h2><span class="num">05</span>The first fine-tune data (<code>fine_tunes/</code>)</h2>
+  <p class="sub">No teleop rig — so the expert is scripted, and the sim generates its own demos for free.</p>
+  <div class="cols">
+    <div>
+      <ul>
+        <li><b>IK-scripted expert:</b> hover → descend → dwell → close → lift → transport → dwell → lower → release → retreat.</li>
+        <li><b>Recorded through the real control path</b> — labels are produced by the same function that will consume the model's output. Servo lag ends up <i>inside</i> the labels.</li>
+        <li><b>Randomised</b> ball position + arm start jitter; <b>rejection sampled</b> — an episode is kept only if the ball ends in the bin.</li>
+        <li><b>50 episodes / 6050 frames @15 fps</b>, written as a LeRobot dataset, converted v2.1→v3.0 on a Modal volume.</li>
+        <li>Fine-tune: action-expert only, VLM frozen, 500 steps, 1× H100.</li>
+      </ul>
+      <div class="row" style="margin-top:1.6vh">
+        <div class="card"><h3>Action-flow loss</h3><div class="big good">0.176 → 0.01</div>
+          <div class="sub" style="margin:0">converged in 500 steps</div></div>
+        <div class="card"><h3>Task success</h3><div class="big bad">0</div>
+          <div class="sub" style="margin:0">unchanged</div></div>
+      </div>
+      <p class="note"><b>Learning:</b> "the loss converged" ≠ "the task works". With the VLM frozen the expert can
+      only learn the <i>average</i> trajectory over the randomisation box — it closes the claw consistently to one
+      side of the ball. More steps optimise a loss already at zero. Grounding needs the VLM to train too (LoRA).</p>
+    </div>
+  </div>
+</section>
+
+<!-- 7 -->
+<section>
+  <h2><span class="num">06</span>Act II — switch to MolmoAct2-LIBERO</h2>
+  <p class="sub">5.57B params, pretrained on <b>LIBERO</b>: a robosuite/<b>MuJoCo</b> benchmark on a <b>Franka Panda</b>. Same simulator family, same arm.</p>
+  <div class="cols">
+    <div>
+      <table>
+        <tr><th></th><th>DROID</th><th>LIBERO</th></tr>
+        <tr><td>control mode</td><td>absolute joint pose</td><td class="good">delta end-effector pose</td></tr>
+        <tr><td>action</td><td>8-D, raw radians</td><td class="good">7-D, normalised [−1,1]</td></tr>
+        <tr><td>horizon</td><td class="n">15</td><td class="n">10</td></tr>
+        <tr><td>control rate</td><td class="n">15 Hz → dec 33</td><td class="n">20 Hz → dec 25</td></tr>
+        <tr><td>state</td><td>joint angles</td><td>eef pos + axis-angle + gripper</td></tr>
+        <tr><td>norm tag</td><td><code>franka_droid</code></td><td><code>libero</code></td></tr>
+      </table>
+      <p class="note" style="margin-top:1.6vh"><b>Silent-failure trap:</b> the serving script hardcoded
+      <code>norm_tag = "franka_droid"</code>. Serving the LIBERO checkpoint under the DROID tag returns
+      <b>garbage actions of exactly the right shape</b> — no error, no warning. This class of bug bit us
+      three separate times (norm tag, gripper sign, camera key).</p>
+    </div>
+    <figure>
+      <img src="img/libero_cameras_matched.png" alt="camera match">
+      <figcaption>Matching our camera to LIBERO's <code>agentview</code>: ours was 1.9× further away with a 1.6× wider FOV — the ball was <b>~5 px</b>, below one vision patch. Unlocalizable.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- 8 -->
+<section>
+  <h2><span class="num">07</span>Making our sim <i>be</i> a LIBERO scene</h2>
+  <p class="sub">The model conditions on absolute eef pose. Our objects sat on the floor; LIBERO's sit on a table with the robot on a 0.912&nbsp;m pedestal.</p>
+  <div class="cols">
+    <div>
+      <pre>Before: eef z 0.469 → 0.386 → 0.220 → 0.020 → <span class="bad">−0.008</span>
+        commanded dz: −0.106, −0.201, −0.289, −0.334  (relentlessly down)
+        the arm drove <b>through the floor</b></pre>
+      <p style="font-size:1.15vw">Every z we reported was ~0.8&nbsp;m outside the training distribution, so the
+      model kept asking for descent that never arrived anywhere.</p>
+      <p style="font-size:1.15vw;margin-bottom:.6vh"><b>Rebuilt the scene against robosuite's own numbers</b>
+      (installed it and measured, rather than guessing):</p>
+      <table>
+        <tr><th>quantity</th><th>LIBERO</th><th>ours after</th></tr>
+        <tr><td>eef at reset, rel. link0</td><td class="n">(0.4515, 0, 0.2613)</td><td class="n good">(0.4515, 0, 0.2608)</td></tr>
+        <tr><td>eef axis-angle at reset</td><td class="n">(3.1408, 0.0018, −0.0899)</td><td class="n good">(3.1403, 0, −0.0892)</td></tr>
+        <tr><td>table top rel. link0</td><td class="n">−0.012</td><td class="n good">−0.012 <small>(was −0.112)</small></td></tr>
+        <tr><td>ball size @256²</td><td class="n">~17 px</td><td class="n good">16×17 px</td></tr>
+      </table>
+      <p class="note"><b>Learning:</b> four independent, <i>measurable</i> errors — table 100&nbsp;mm too low,
+      eef site 9.5&nbsp;mm out and yawed 90°, wrong reset pose, wrong origin offset. Also swapped in the
+      <b>stock Franka hand</b> and robosuite's own wrist camera. Never hand-derive geometry — compute it,
+      then <i>render</i> it and look.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 9 -->
+<section>
+  <h2><span class="num">08</span>Delta-EE actions → Panda joint control</h2>
+  <p class="sub">The policy emits a Cartesian delta. MuJoCo needs actuator commands. Two routes.</p>
+  <div class="cols">
+    <div class="card">
+      <h3>Route A — differential IK <small style="color:var(--dim)">(first)</small></h3>
+      <ul>
+        <li>delta → Cartesian target → one DLS <b>IK</b> step → command <b>joint positions</b>.</li>
+        <li>Kept the existing position actuators, so nothing else changed.</li>
+        <li><b>No compliance:</b> IK solves for whatever it is handed and presses at up to 87&nbsp;N·m.
+          Needed a <code>--min-clearance</code> table clamp to stop the hand sinking.</li>
+        <li>Realises ~33% of a commanded delta per tick.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Route B — native OSC <small class="good">(now default)</small></h3>
+      <ul>
+        <li>Ported robosuite <b>1.4.0's <code>OSC_POSE</code></b> onto <b>torque</b> actuators — the controller
+          LIBERO actually trained through.</li>
+        <li>Sag <b>0.000&nbsp;mm</b>. No IK failures (<code>pinv</code> degrades smoothly). Compliance is native,
+          so the clamp is off.</li>
+        <li>Timing detail that would have been a silent bug: robosuite recomputes torque <b>every physics step</b>
+          (500&nbsp;Hz) and only re-sets the goal at 20&nbsp;Hz. Holding one torque for 25 steps is a different,
+          unstable controller.</li>
+        <li>Realises <b>12.3%</b> per tick — matches the analytic critically-damped response to 0.3 pts.
+          <b>Near 100% would mean the port is wrong.</b></li>
+      </ul>
+    </div>
+  </div>
+  <p class="note">Sanity check that unblocked everything: ran the checkpoint against <b>LIBERO's own benchmark env</b> —
+  <b class="good">3/3 success</b>. That rules out the serving path, the norm stats, the image orientation and the state
+  layout in one shot, and puts the fault squarely on our side of the wire.</p>
+</section>
+
+<!-- 10 -->
+<section>
+  <h2><span class="num">09</span>MolmoAct2-LIBERO, natively on our task</h2>
+  <p class="sub">Reaches the ball reliably. Lifts it sometimes.</p>
+  <figure style="flex:1">
+    <img src="img/molmoact_lift.png" alt="molmoact lift sequence">
+    <figcaption>A successful grasp-and-lift — ball 104&nbsp;mm off the table (it does not survive the transport).</figcaption>
+  </figure>
+  <div class="cols" style="flex:0 0 auto;margin-top:1.4vh">
+    <div>
+      <ul>
+        <li><b>Aim is excellent:</b> best lateral approach <b>8.1&nbsp;mm</b> (vs 45 / 32&nbsp;mm before the scene fix).</li>
+        <li><b>Grasp-and-lift ~1/3 runs.</b> Placement 0/3.</li>
+        <li>Failure signature: pads close ~1.6&nbsp;mm <b>below</b> the ball's equator, so a frictional sphere squirts out sideways.</li>
+      </ul>
+    </div>
+    <div>
+      <ul>
+        <li><b>The policy samples.</b> Its action expert is flow-matching — two runs from an identical start state
+          diverge completely. <b>One rollout is one draw</b>; only rates over N runs mean anything.</li>
+        <li>Dropped serving from A100-40GB → <b>L4</b>: 2.6× cheaper, <b>no</b> latency penalty (transport dominates, not FLOPs).</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- 11 -->
+<section>
+  <h2><span class="num">10</span>Fine-tuning a 5.57B model — and why we stopped</h2>
+  <p class="sub">Data was cheap. Gradient steps were not.</p>
+  <div class="cols">
+    <div>
+      <p style="font-size:1.15vw;margin:0 0 .8vh"><b>Data generated</b> (local CPU, free):</p>
+      <ul>
+        <li>Cohorts: <b>reach</b> (clean expert), <b>noise</b> (perturbed — teaches correction), <b>recover</b> (a hard kick mid-approach).</li>
+        <li>Labels are the delta from the arm's <b>actual</b> pose to the reference — closed-loop, never a replayed plan.</li>
+        <li>Written in the released LIBERO dataset's exact schema: <b>LeRobot v3.0</b>, inline PNG, 8-D state, mirrored gripper pair.</li>
+        <li>Found a physics bug on the way: the expert lifted the ball every time, then dropped it mid-transport.
+          A round ball between two flat pads is held by <b>friction alone</b> — nothing about the shape traps it —
+          and the gripper kept squeezing until the ball squirted out sideways.
+          <b>We increased the friction on the ball and made the contact stiffer, so the squeeze stops at the surface.</b>
+          Demos then completed reliably.</li>
+      </ul>
+      <p style="font-size:1.15vw;margin:1.4vh 0 .8vh"><b>Then the budget hit:</b></p>
+      <pre>trainable params        657 M  (LoRA r32 on VLM + full action expert)
+checkpoint save         200 s each  (~$0.22 a save)
+$5 budget       =  150 steps x batch 8  =  <b class="bad">0.06 epochs</b></pre>
+      <p style="font-size:1.15vw;margin:0 0 1vh"><b>On the LoRA rank.</b> Started at <b>r32</b> — deliberately
+      <b>overkill</b> for one task with one instruction string, but I wanted to see what the ceiling looked like
+      before economising. The plan was to then sweep <b>r4 / r8</b>: ~4–8× fewer trainable parameters, cheaper
+      steps, and a better fit to 30 episodes of a single task. <b>Never got there</b> — the budget ran out at the
+      first rank.</p>
+      <p class="note"><b>Decision:</b> at 0.06 epochs the honest read is "the checkpoint has barely moved off the
+      base" — the risk isn't overfitting, it's paying to change nothing. A 5.6B model made every experiment cost
+      real money, including the rank sweep. So: <b>drop the MolmoAct2 fine-tune and change the model instead.</b></p>
+    </div>
+  </div>
+</section>
+
+<!-- 12 -->
+<section>
+  <h2><span class="num">11</span>Act III — SmolVLA-LIBERO: 12× smaller</h2>
+  <p class="sub">Same benchmark, same conventions, a size where fine-tuning is actually affordable.</p>
+  <div class="cols">
+    <div>
+      <table>
+        <tr><th></th><th>MolmoAct2-LIBERO</th><th>SmolVLA-LIBERO</th></tr>
+        <tr><td>params</td><td class="n">5.57 B</td><td class="n good">0.45 B</td></tr>
+        <tr><td>VLM backbone</td><td>Molmo (Olmo + ViT)</td><td>SmolVLM2-500M</td></tr>
+        <tr><td>vision tokens</td><td>high-res, multi-crop</td><td>few tokens, <b>half the VLM layers skipped</b></td></tr>
+        <tr><td>action head</td><td>flow-matching expert (0.62 B)</td><td>flow-matching expert (~0.1 B)</td></tr>
+        <tr><td>extra supervision</td><td><b>reasoning / trace tokens</b> before acting</td><td>none — pure action</td></tr>
+        <tr><td>attention</td><td>causal LM over all tokens</td><td>interleaved <b>cross-attn + self-attn</b> expert</td></tr>
+        <tr><td>chunk</td><td class="n">10</td><td class="n">50 (we serve 10)</td></tr>
+        <tr><td>serving GPU</td><td>L4 24 GB</td><td class="good">T4 16 GB — cheapest offered</td></tr>
+        <tr><td>fine-tune cost</td><td class="bad">$5 = 0.06 epochs</td><td class="good">$5 = many epochs</td></tr>
+      </table>
+      <p class="note"><b>The trade:</b> MolmoAct2 spends parameters on <i>reasoning about</i> the scene; SmolVLA
+      spends them on being small enough to actually adapt to <i>your</i> scene. For a single, narrow task the
+      second is worth more. Published LIBERO avg 87.3% — treat as unverified, a reproduction issue reports 73%.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 13 -->
+<section>
+  <h2><span class="num">12</span>SmolVLA stock — reaches, never picks</h2>
+  <div class="cols">
+    <div>
+      <ul>
+        <li>Conventions matched <b>byte for byte</b> without translation: 8-D state, 7-D delta-EE action,
+          two 256² cameras, same <code>/act</code> wire format. The sim client needed <b>zero</b> changes.</li>
+        <li>One trap: the wrist camera key. The policy looks up <code>observation.images.image2</code>;
+          hand it <code>wrist_image</code> and it <b>does not error</b> — the wrist view just silently disappears.
+          Renamed on both the dataset and the wire.</li>
+        <li>Full <b>OSC</b> path throughout — the largest remaining divergence from the plant it was trained on, removed.</li>
+        <li><b>Result over 7 rollouts: 0 lifts, 0 placements.</b> Closest lateral approach 10.7&nbsp;mm; it
+          reaches the ball and shoves it.</li>
+      </ul>
+      <p class="note">This is a <b>grounding</b> failure, not an action-generation one: across randomised ball
+      positions closest approach was 10.7 / 108.2 / 46.4&nbsp;mm. Missing by 108&nbsp;mm at an unseen ball
+      position means the VLM must be trained — so <b>LoRA on the VLM</b>, not the frozen-VLM recipe HuggingFace ships.</p>
+    </div>
+    <figure>
+      <img src="img/smolvla_stock.png" alt="smolvla stock rollout">
+      <figcaption>Stock SmolVLA: approach is close, the grasp isn't — the ball gets batted away.</figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- 14 -->
+<section>
+  <h2><span class="num">13</span>Fine-tuning SmolVLA</h2>
+  <p class="sub">Regenerated the dataset from scratch, because the controller had changed.</p>
+  <div class="cols">
+    <div>
+      <p style="font-size:1.15vw;margin:0 0 .6vh"><b>Data — <code>a5</code>, OSC-native:</b></p>
+      <ul>
+        <li><b>30 episodes / 16,170 frames @ 20 fps</b>, LeRobot v3.0.</li>
+        <li>Re-collected <b>through the OSC controller</b>. The earlier sets were IK-collected: the two plants
+          realise ~33% and ~12.3% of a commanded delta per tick, so their labels differ by ~<b>3×</b> and are
+          <b>not interchangeable</b>.</li>
+        <li>Noise magnitude re-calibrated from scratch for the new plant, not carried over.</li>
+      </ul>
+      <p style="font-size:1.15vw;margin:1.2vh 0 .6vh"><b>Training:</b></p>
+      <ul>
+        <li><b>LoRA on the VLM + full action expert</b> (grounding is what fails).</li>
+        <li>Kept the <b>checkpoint's own normalisation stats</b> — rebuilding them from 30 episodes hands the
+          expert a different affine map than it was trained under.</li>
+        <li>LR decay pinned to the <i>actual</i> run length (the shipped schedule assumes 30k steps — run 2k
+          against it and the LR never decays).</li>
+        <li>Ran to <b>~2000 steps</b>. <b class="warn">Loss had not converged</b> — stopped on time budget, not on a plateau.</li>
+      </ul>
+      <p class="note"><b>Overfitting watch:</b> 30 episodes of one task, one instruction string. The tell is the
+      rotation channels collapsing — our task holds one top-down orientation throughout, so there is almost no
+      rotational signal to learn. Save often and score <i>every</i> checkpoint in closed loop; the last one is
+      not automatically the best.</p>
+    </div>
+  </div>
+</section>
+
+<!-- 15 -->
+<section>
+  <h2><span class="num">14</span>Where it landed</h2>
+  <p class="sub">Fine-tuned SmolVLA — the best behaviour this project has produced.</p>
+  <figure style="flex:1">
+    <img src="img/smolvla_ft_lift.png" alt="smolvla fine-tuned lift">
+    <figcaption>Descend → centre on the ball → close → <b>lift</b>. Ball held clear of the table for the rest of the run.</figcaption>
+  </figure>
+  <div class="row" style="flex:0 0 auto;margin-top:1.4vh">
+    <div class="card"><h3>Best lateral approach</h3><div class="big good">0.1 mm</div>
+      <div class="sub" style="margin:0">stock SmolVLA: 10.7 mm · MolmoAct2: 8.1 mm</div></div>
+    <div class="card"><h3>Ball lifted &amp; held</h3><div class="big good">183 mm</div>
+      <div class="sub" style="margin:0">sustained across ~20 chunks, not a bounce</div></div>
+    <div class="card"><h3>Rate over rollouts</h3><div class="big warn">1 / 3</div>
+      <div class="sub" style="margin:0">the others hover over the ball and stall</div></div>
+  </div>
+  <p class="note" style="margin-top:1.4vh">Honest read: the typical run now <b>hovers directly above the ball</b>
+  rather than missing or shoving it — the approach is solved, the commit to a grasp is not. That is what an
+  under-trained checkpoint looks like, and the loss curve agrees.</p>
+</section>
+
+<!-- 16 -->
+<section>
+  <h2><span class="num">15</span>What we actually learned</h2>
+  <div class="cols">
+    <div>
+      <ul>
+        <li><b>Pick the checkpoint for your <i>plant</i>, not its benchmark score.</b> DROID→LIBERO was worth more
+          than any tuning: same simulator, same arm, same action convention.</li>
+        <li><b>Log everything, always.</b> Every run wrote a JSONL of state-before, state-after, the model's raw
+          actions and the timings — plus every rendered frame — flushed live so a run could be watched as it went.
+          Almost nothing here was diagnosed by watching the arm; it was diagnosed by reading the logs afterwards.
+          The decimation bug, the descent through the floor, the gripper that never closed, the grasp sitting
+          7&nbsp;mm below the equator — all of them are invisible on screen and obvious in a log column.</li>
+        <li>The logs also made experiments <b>free</b>: replaying recorded actions at different settings answered
+          questions that would otherwise have cost GPU time, and let old runs be re-scored months later against
+          a metric that didn't exist when they ran.</li>
+      </ul>
+    </div>
+    <div>
+      <ul>
+        <li><b>Loss convergence ≠ task success.</b> The DROID action expert hit 0.01 and changed nothing —
+          with a frozen VLM it can only learn the average trajectory.</li>
+        <li><b>Model size is an experiment-rate constraint.</b> 5.6B meant $5 bought 0.06 epochs. 450M turned the
+          same budget into a real run — and it is the smaller model that lifts the ball.</li>
+        <li><b>Labels must come from the controller that will consume them.</b> Changing IK→OSC invalidated every
+          dataset collected before it.</li>
+        <li><b>Decimation + sequential replanning</b> are what make the loop look real-time — and they were bugs
+          that capped every prior result at zero.</li>
+      </ul>
+      <p class="note"><b>Next:</b> train past the plateau, sweep where the eef arrests (grasp still sits just under
+      the equator), and score N rollouts per checkpoint instead of one.</p>
+    </div>
+  </div>
+</section>
+
+</div>
+<footer><span id="label"></span><span><span id="idx"></span> &nbsp;·&nbsp; ←/→ or space</span></footer>
+<script>
+const s=[...document.querySelectorAll('section')];let i=0;
+const titles=s.map(x=>{const h=x.querySelector('h2,h1');return h?h.textContent.replace(/^\d+/,'').trim():''});
+function go(n){i=Math.max(0,Math.min(s.length-1,n));s.forEach((x,k)=>x.classList.toggle('on',k===i));
+  document.getElementById('idx').textContent=(i+1)+' / '+s.length;
+  document.getElementById('label').textContent=titles[i];
+  location.hash=i+1;}
+addEventListener('keydown',e=>{
+  if(['ArrowRight','PageDown',' '].includes(e.key)){e.preventDefault();go(i+1)}
+  else if(['ArrowLeft','PageUp'].includes(e.key)){e.preventDefault();go(i-1)}
+  else if(e.key==='Home')go(0); else if(e.key==='End')go(s.length-1);
+  else if(e.key==='f')document.documentElement.requestFullscreen();});
+addEventListener('click',e=>{if(!e.target.closest('a'))go(i+ (e.clientX < innerWidth*0.25 ? -1 : 1))});
+go(parseInt(location.hash.slice(1))-1||0);
+</script>
+</body>
+</html>

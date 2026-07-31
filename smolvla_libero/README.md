@@ -136,6 +136,32 @@ uv run python libero/libero_closed_loop.py \
     --run-id smolvla_stock_00
 ```
 
+### Which controller this runs under
+
+Nothing here needs wiring: this path drives `libero/libero_closed_loop.py` itself, so it
+picked up the OSC port automatically. As of 2026-07-28 that client defaults to
+**`--control-mode osc`** — a port of robosuite's own `OSC_POSE` writing joint torques on
+`scene_libero_osc.xml` — instead of the old Route A IK-into-position-servos. See
+`libero/README.md` "Control" and `PROGRESS.md` §22.
+
+That matters more for SmolVLA than for MolmoAct2, for one reason: the argument for this
+checkpoint is that its conventions *already* line up with LIBERO's, so the fewer places
+we diverge from the plant it was trained on, the more meaningful a stock-checkpoint
+number is. The controller was the largest remaining divergence.
+
+```bash
+# the pre-2026-07-28 controller, if a run needs to be compared against older logs
+uv run python libero/libero_closed_loop.py --control-mode ik --payload-keys libero ...
+```
+
+**Consequence for `data/a4_smolvla`.** It descends from `libero/fine_tune/a4`, whose
+labels were produced through Route A. The collector's design rule is that labels come
+from the controller that will consume them, so a fine-tune trained on it and served
+through OSC breaks that rule. Regenerating `a4` against OSC (free, local CPU) has to
+happen before the fine-tune this directory is being set up for — and the conversion here
+re-run on top of it. The key rename and stats logic in `convert_dataset.py` are
+unaffected; only the underlying episodes change.
+
 `--payload-keys libero` is required: it sends `{image, wrist_image, instruction, state}`.
 The `droid` default sends `external_cam` / `wrist_cam`, which this server rejects with a 400
 rather than silently running blind.
@@ -175,8 +201,10 @@ It also settles the reproduction-gap caveat above with our own measurement.
 
 - **Nothing has been run against the sim.** The server is written and its conventions are
   checked against the checkpoint's own `config.json` at container start, but no rollout exists.
-- **No fine-tune.** `data/a4_smolvla` is ready for one; the normalisation-stats question above
-  has to be answered first.
+- **No fine-tune.** `data/a4_smolvla` is ready for one, but two things now gate it: the
+  normalisation-stats question above, and the fact that its labels came from Route A while the
+  client now serves through OSC (see "Which controller this runs under"). `a4` needs
+  regenerating and converting again first.
 - **`a4`'s rotation channels are ~2.5x narrower than released LIBERO's**
   (`libero/fine_tune/README.md` §6) — our task holds one top-down orientation throughout. Any
   fine-tune on it will see almost no rotational signal, and that is where overfitting shows

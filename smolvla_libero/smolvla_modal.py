@@ -56,9 +56,21 @@ Usage:
     modal deploy smolvla_libero/smolvla_modal.py         # persistent, prints a stable URL
 """
 
+import os
+
 import modal
 
-CHECKPOINT = "HuggingFaceVLA/smolvla_libero"
+# Which weights to serve. Defaults to the stock HuggingFace checkpoint; set
+# SMOLVLA_CHECKPOINT to a path on the `molmoact2-checkpoints` volume to serve one of our
+# fine-tunes instead, e.g.
+#
+#   SMOLVLA_CHECKPOINT=/checkpoints/smolvla/smolvla-green-ball-osc/checkpoints/002000/pretrained_model \
+#       modal deploy smolvla_libero/smolvla_modal.py
+#
+# The env var is read at DEPLOY time (it is baked into the image below), not per request,
+# so a stock deployment and a fine-tuned one are separate deployments with separate URLs --
+# which is what you want when scoring one against the other.
+CHECKPOINT = os.environ.get("SMOLVLA_CHECKPOINT", "HuggingFaceVLA/smolvla_libero")
 
 # How many actions one /act call returns. See "ACTION HORIZON" above.
 ACTION_HORIZON = 10
@@ -90,9 +102,15 @@ image = (
     # extra drags in robosuite -> egl_probe, which needs cmake and an OpenGL toolchain and
     # exists only to run the LIBERO *simulator*. Our simulator is local MuJoCo.
     .pip_install("lerobot[smolvla]", "fastapi[standard]", "json-numpy", "pillow")
+    # Bake the selected checkpoint into the image so the container reads the same value the
+    # deploy was made with, rather than whatever the environment happens to hold at runtime.
+    .env({"SMOLVLA_CHECKPOINT": CHECKPOINT})
 )
 
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)
+# Where smolvla_modal_train.py writes its checkpoints. Mounted read-only as far as this app
+# is concerned -- it only ever loads from it.
+checkpoints = modal.Volume.from_name("molmoact2-checkpoints", create_if_missing=True)
 
 app = modal.App("smolvla-libero")
 
@@ -100,7 +118,7 @@ app = modal.App("smolvla-libero")
 @app.cls(
     image=image,
     gpu=GPU,
-    volumes={"/cache/huggingface": hf_cache},
+    volumes={"/cache/huggingface": hf_cache, "/checkpoints": checkpoints},
     # Keep a container warm for 5 min after the last request so back-to-back rollouts do not
     # each re-pay the cold-start model load. Scales to zero after that -- no GPU billed idle.
     scaledown_window=300,

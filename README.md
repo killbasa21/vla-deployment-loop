@@ -1,5 +1,36 @@
 # Servo droop, and why it was poisoning the fine-tune data
 
+> ## SUPERSEDED IN ITS PREMISE, 2026-07-28 (later the same day)
+>
+> This document diagnoses a bug that exists **only because the arm was driven by position
+> actuators**. `libero_closed_loop.py` now defaults to `--control-mode osc`, a port of
+> robosuite's own `OSC_POSE` writing joint torques, and measured on that plant the
+> standing sag is **0.000 mm** (`libero/tools/verify_osc.py` check 2) against the 4.84 mm
+> analysed below. There is no joint setpoint to lag behind, so droop cannot enter the
+> labels at all. See `libero/PROGRESS.md` §22.
+>
+> What this file remains good for: the *method* (§5 especially — how every number was
+> produced), the fact that the same class of bug is created by any label defined as
+> `target − current`, and the `a1`/`a3` distribution measurements, which are still the
+> reference for what our data looks like against released LIBERO.
+>
+> **Three specific claims here are now wrong or moot:**
+> - §4.1 records the `kp×2 kd×0.7` gain change as landed. The **compiled model** reads
+>   menagerie's stock `4500/450` — the actuator lines were reverted at 17:11 on
+>   2026-07-28 while the comment above them was left in place, and the file is untracked
+>   inside the gitignored `mujoco_menagerie` submodule so there is no history. Verify
+>   gains by compiling and reading `actuator_gainprm`, never by reading the XML.
+> - §1.1's "0.2728 vs LIBERO's 0.2733" was correctly identified as a pure-FK number
+>   compared against a dynamic one. Under OSC the settled pose **is** the FK pose, so the
+>   0.5 mm match is now literally true.
+> - §3.5's "stiffening is a move toward LIBERO's tightly-tracking OSC" was the right
+>   instinct pointed at a proxy. Running the actual OSC makes it unnecessary.
+>
+> **And one consequence that is not moot:** `a3`/`a4` were collected through Route A, so
+> they must be regenerated against OSC before the next fine-tune. `NOISE_SIGMA_POS` must
+> be **re-calibrated**, not carried over — §4.3 cut it 0.15 → 0.08 precisely because a
+> different plant realised a different fraction of each perturbation.
+
 Written 2026-07-28. This is the "read this to understand what happened" document for the
 LIBERO fine-tune data problem. It covers what droop is, how it got into the training
 labels, every calculation used to find and fix it, the things I got wrong on the way, and

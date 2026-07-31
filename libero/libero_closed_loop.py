@@ -16,28 +16,64 @@ Every outer iteration:
   2. Read proprioception as LIBERO's own 8-D state:
      [eef_pos(3), eef_axisangle(3), gripper_qpos(2)].
   3. POST {images, instruction, state} to /act -> action chunk, shape (N, 7).
-  4. For each action: convert the normalized delta to a Cartesian target pose, solve IK
-     for it (Route A -- see below), write joint targets to data.ctrl, and step physics
-     `decimation` times to advance one 20 Hz control tick.
+  4. For each action: turn the normalized delta into arm commands via `--control-mode`,
+     and step physics `decimation` times to advance one 20 Hz control tick.
 
-ROUTE A (differential IK), and why not real OSC
------------------------------------------------
-LIBERO drives its Panda through an operational-space controller that turns a Cartesian
-delta into joint torques. Reimplementing that here would mean swapping the scene's
-position actuators for torque actuators and re-tuning gains from scratch -- discarding
-the characterization behind panda.xml's kp=4500 / kd=450 / forcerange +/-87. Instead we
-keep the position actuators and, per tick, re-solve IK for the requested Cartesian
-target and command the resulting joint pose. Same damped-least-squares solver as
-phase4_collect_demos.solve_ik.
+TWO CONTROL MODES
+-----------------
+`--control-mode osc` (default) and `--control-mode ik`. They need DIFFERENT SCENES,
+because they write different physical quantities into the same `data.ctrl` array, and
+the loop refuses a mismatched pair rather than producing plausible nonsense.
 
-This is an approximation of OSC, not OSC. It tracks the commanded *pose* rather than
-reproducing OSC's compliance, so contact-rich behavior will differ. Good enough to find
-out whether the checkpoint understands the scene at all, which is the current question.
+  osc  scene_libero_osc.xml    ctrl[0:7] = JOINT TORQUE (N.m), <motor> actuators
+       A port of robosuite 1.4.0's OSC_POSE -- the controller LIBERO actually uses --
+       in libero/osc_controller.py. Cartesian PD (kp=150, critically damped) -> wrench
+       -> J^T -> torques, with gravity compensation and a nullspace term. See that
+       module for what is and is not ported.
+
+  ik   scene_libero_hand.xml   ctrl[0:7] = JOINT ANGLE (rad), position servos
+       "Route A", the original stand-in: convert the delta to a Cartesian target, solve
+       one damped-least-squares IK step, command the resulting joint pose. Kept so
+       every run and dataset produced before 2026-07-28 stays reproducible.
+
+WHY OSC IS NOW THE DEFAULT
+--------------------------
+Route A was always known to be an approximation, and three long-running problems in this
+project turned out to be artefacts of it rather than of the policy. Measured by
+libero/tools/verify_osc.py, all four checks passing:
+
+  droop         position servo sags 4.84 mm at rest, so the collector's
+                (target - current) label carries a standing bias into EVERY frame --
+                the subject of the whole top-level README.md. OSC sags 0.000 mm, because
+                there is no joint setpoint to lag behind. It also makes the settled eef
+                height 0.2728 against LIBERO's 0.2733, i.e. the 0.5 mm match the docs
+                always claimed but which was really a pure-FK number (README sec.1.1).
+  compliance    driven relentlessly into the table for 120 ticks, OSC penetrates 1.11 mm
+                at 35.4 N and comes to rest 14.7 mm above the surface. The position servo
+                managed -2.9 mm at ~70 N (PROGRESS sec.19). `--min-clearance`, which
+                exists only to fake this, therefore defaults to OFF in osc mode.
+  IK failure    `IK unreached 10/10` appears in the two failing runs of README sec.9.
+                OSC has no convergence criterion; `opspace_matrices` uses pinv, so near a
+                singularity the commanded wrench degrades smoothly instead of failing.
+
+ONE THING THAT IS NOT AN IMPROVEMENT, AND MUST NOT BE "FIXED":
+OSC realises only ~12.3% of a commanded delta per 20 Hz tick, where the position servo
+managed ~33%. That is correct, not a regression -- it matches the analytic step response
+of a critically damped system at wn = sqrt(150) to within 0.3 points, and the policy was
+trained through exactly this response, so its commanded magnitudes already account for
+it. A value near 100% would mean the port is WRONG.
+
+CONSEQUENCE FOR THE DATASETS: a3/ and a4/ were collected through `apply_action`, i.e.
+Route A. The collector's design rule is that labels are produced by the controller that
+will consume them, so training on them and serving through OSC breaks that rule. They
+need regenerating against OSC before the next fine-tune. See libero/fine_tune/README.md.
 
 Usage:
     uv run python libero/libero_closed_loop.py --dry-run --server-url <url>/act
     uv run python libero/libero_closed_loop.py --chunks 20 --server-url <url>/act
     uv run python libero/libero_closed_loop.py --chunks 20 --image-flip 180 --server-url <url>/act
+    uv run python libero/libero_closed_loop.py --control-mode ik \
+        --model-path mujoco_menagerie/franka_emika_panda/scene_libero_hand.xml ...
 """
 
 import argparse
@@ -54,6 +90,13 @@ import mujoco.viewer
 import numpy as np
 import requests
 from PIL import Image
+
+# Absolute-ish import so this works both as `python libero/libero_closed_loop.py` and as
+# `import libero.libero_closed_loop` (which collect_finetune_data.py and score_runs.py do).
+try:
+    from libero.osc_controller import OSCController
+except ImportError:  # run directly, with libero/ itself on sys.path
+    from osc_controller import OSCController
 
 json_numpy.patch()
 
@@ -74,7 +117,16 @@ json_numpy.patch()
 # differed from it in four things that all sit inside the model's own observation/action
 # space -- reported gripper_qpos units, the eef-site convention, pad friction, and which
 # end of the ctrl range means "open". See panda_libero_hand.xml's header.
-DEFAULT_MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_libero_hand.xml"
+# Two scenes, one per --control-mode, because the arm actuators differ: scene_libero_osc
+# has <motor> (ctrl = torque) and scene_libero_hand has position servos (ctrl = radians).
+# Writing one mode's commands into the other's actuators produces plausible-looking
+# garbage rather than an error, so main() checks the actuator type and refuses. The
+# default follows --control-mode; --model-path overrides it explicitly.
+SCENE_FOR_MODE = {
+    "osc": "mujoco_menagerie/franka_emika_panda/scene_libero_osc.xml",
+    "ik": "mujoco_menagerie/franka_emika_panda/scene_libero_hand.xml",
+}
+DEFAULT_MODEL_PATH = SCENE_FOR_MODE["ik"]   # kept: imported by score_runs.py's --model-path
 SERVER_URL = "http://localhost:8000/act"
 INSTRUCTION = "pick up the green ball and put it in the green container"
 
@@ -427,6 +479,38 @@ PAYLOAD_KEY_SETS = {
 }
 
 
+def apply_action_osc(osc, data, action):
+    """OSC counterpart of `apply_action`: set the Cartesian goal for one control tick.
+
+    Unlike `apply_action` this writes NOTHING to data.ctrl -- under OSC the torque
+    depends on the live state, so it has to be recomputed every physics step inside the
+    decimation loop (robosuite does the same: environments/base.py:454 calls the
+    controller each sim step, with set_goal firing only on the first). Returns the same
+    (ok, delta_pos_norm, clamped) triple as `apply_action` so the caller stays uniform.
+
+    `ok` is always True: OSC has no convergence criterion to fail, which is the point --
+    it is the analogue of Route A's `IK unreached`, and it cannot happen. Saturation is
+    the OSC-mode failure signal instead, and it is counted per physics step by the
+    controller itself (`osc.last_saturated`).
+    """
+    a = np.clip(np.asarray(action, dtype=np.float64).reshape(-1), -1.0, 1.0)
+    dpos = a[0:3] * DELTA_POS_SCALE
+    drot = a[3:6] * DELTA_ROT_SCALE
+
+    osc.set_goal(data, dpos, drot)
+    clamped = osc.clamp_goal_z(EEF_MIN_Z) if np.isfinite(EEF_MIN_Z) else False
+
+    # The gripper is NOT part of OSC. Its actuator is still a position servo in
+    # scene_libero_osc.xml (robosuite keeps its gripper position-controlled too --
+    # panda_gripper.xml uses <position kp=1000>), so this is byte-identical to
+    # `apply_action`'s gripper handling: action -1 = open, and actuator8 has 255 = open,
+    # hence the inversion.
+    closed_frac = (a[6] - GRIPPER_ACTION_OPEN) / (GRIPPER_ACTION_CLOSED - GRIPPER_ACTION_OPEN)
+    data.ctrl[7] = (1.0 - float(np.clip(closed_frac, 0.0, 1.0))) * GRIPPER_CTRL_MAX
+
+    return True, float(np.linalg.norm(dpos)), clamped
+
+
 def query_server(main_img, wrist_img, state, server_url, send_wrist=True, timeout=30,
                  payload_keys="droid"):
     """POST one observation and return (actions, server_dt_ms, request_bytes)."""
@@ -496,18 +580,48 @@ BALL_SAMPLE_Y = (-0.12, 0.12)
 TRACKED_OBJECT_CANDIDATES = ("green_ball", "red_box")
 
 
-def build_sim(model_path, randomize_ball=False, rng=None):
+def is_torque_actuated(model):
+    """True if the arm actuators are <motor> (ctrl = torque), False for position servos.
+
+    `<motor>` compiles to gaintype=fixed / biastype=none; the position servos here are
+    biastype=affine. Checking the compiled model rather than the filename is deliberate:
+    this project has twice been bitten by an XML whose comment disagreed with its values
+    (see panda_libero_osc.xml's header), and the compiled model is the only ground truth.
+    """
+    return int(model.actuator_biastype[0]) == int(mujoco.mjtBias.mjBIAS_NONE)
+
+
+def build_sim(model_path, randomize_ball=False, rng=None, control_mode="osc"):
+    """Returns (model, data, osc). `osc` is None in ik mode."""
     model = mujoco.MjModel.from_xml_path(model_path)
     data = mujoco.MjData(model)
     home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if home != -1:
         mujoco.mj_resetDataKeyframe(model, data, home)
 
-    # Start from LIBERO's own reset posture rather than the scene's home keyframe. Both
-    # qpos AND ctrl must be set: ctrl is the position actuators' target, so leaving it at
-    # the keyframe's value would just drag the arm back to the old pose on the first step.
+    torque_mode = control_mode == "osc"
+    if torque_mode != is_torque_actuated(model):
+        raise SystemExit(
+            f"--control-mode {control_mode} needs "
+            f"{'torque <motor>' if torque_mode else 'position servo'} arm actuators, but "
+            f"{model_path} has the other kind. Use "
+            f"{SCENE_FOR_MODE[control_mode]}, or pass the matching --control-mode.\n"
+            "Refusing rather than running: writing torques into position actuators (or "
+            "vice versa) reinterprets N.m as radians and produces plausible-looking "
+            "garbage instead of an error."
+        )
+
+    # Start from LIBERO's own reset posture rather than the scene's home keyframe.
     data.qpos[:7] = LIBERO_INIT_QPOS
-    data.ctrl[ARM] = LIBERO_INIT_QPOS
+    if torque_mode:
+        # ctrl is TORQUE here. Zero it -- the keyframe's arm entries are joint angles in
+        # the position-servo scene, and copying them would command a constant few N.m.
+        # The arm is then held up by the OSC controller below, not by ctrl.
+        data.ctrl[ARM] = 0.0
+    else:
+        # ctrl is the position actuators' target, so it must be set too: leaving it at
+        # the keyframe's value would just drag the arm back to the old pose on step 1.
+        data.ctrl[ARM] = LIBERO_INIT_QPOS
     data.ctrl[7] = GRIPPER_CTRL_MAX  # gripper open (stock hand: 255 = open)
 
     for name, pos in FREE_BODY_INITIAL_POSES.items():
@@ -526,11 +640,33 @@ def build_sim(model_path, randomize_ball=False, rng=None):
         data.qpos[adr + 3:adr + 7] = [1, 0, 0, 0]
 
     mujoco.mj_forward(model, data)
+
+    osc = None
+    if torque_mode:
+        site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "grip_site")
+        osc = OSCController(model, site_id)
+        osc.reset(data)
+
     # Let contacts settle so objects rest on the table rather than being reported
     # mid-drop in the first observation the model sees.
+    #
+    # In torque mode "do nothing" has to be ACTIVELY COMMANDED: with ctrl = 0 the arm is
+    # unpowered and simply falls. osc.reset() parked the goal on the current pose, so
+    # running the controller here holds station -- which is also what robosuite does
+    # between policy steps, so this is not a special case, just the normal control law
+    # with a zero delta.
     for _ in range(200):
+        if osc is not None:
+            data.ctrl[ARM] = osc.compute_torque(model, data)
         mujoco.mj_step(model, data)
-    return model, data
+
+    if osc is not None:
+        # Re-park the nullspace reference and goal on the SETTLED pose. Under OSC the
+        # settled pose is the FK pose to ~1e-16 (verify_osc.py check 2), so this is
+        # nearly a no-op -- but it keeps the invariant "goal == where we actually are"
+        # true at the moment the first observation is taken, rather than nearly true.
+        osc.reset(data)
+    return model, data, osc
 
 
 def make_key_callback(model, viewer_ref):
@@ -587,7 +723,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--server-url", default=SERVER_URL,
                         help=f"/act endpoint (default: {SERVER_URL})")
-    parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--control-mode", choices=("osc", "ik"), default="osc",
+        help=(
+            "how a delta action becomes arm commands. 'osc' (default) runs a port of "
+            "robosuite's OSC_POSE -- the controller LIBERO itself uses -- writing joint "
+            "TORQUES, and needs scene_libero_osc.xml. 'ik' is the original Route A: "
+            "damped-least-squares IK into position servos, needing scene_libero_hand.xml. "
+            "--model-path defaults to whichever scene matches; a mismatched pair is a "
+            "hard error, not a warning. See this file's header for what changes"
+        ),
+    )
+    parser.add_argument(
+        "--model-path", default=None,
+        help="scene XML; defaults to the one matching --control-mode (see SCENE_FOR_MODE)",
+    )
     parser.add_argument("--chunks", type=int, default=10,
                         help="action chunks to run; <=0 runs until killed")
     parser.add_argument("--dry-run", action="store_true",
@@ -632,7 +782,9 @@ def main():
         ),
     )
     parser.add_argument(
-        "--min-clearance", type=float, default=DEFAULT_MIN_CLEARANCE,
+        # default=None so main() can pick per --control-mode: DEFAULT_MIN_CLEARANCE in
+        # ik mode (unchanged behaviour), OFF in osc mode (compliance is native there).
+        "--min-clearance", type=float, default=None,
         help=(
             f"metres the commanded eef target is kept above the table top "
             f"(default {DEFAULT_MIN_CLEARANCE}). Route A commands joint positions, so "
@@ -668,7 +820,12 @@ def main():
 
     send_wrist = not args.no_wrist_to_model
     rng = np.random.default_rng(args.seed) if args.randomize_ball else None
-    model, data = build_sim(args.model_path, randomize_ball=args.randomize_ball, rng=rng)
+    if args.model_path is None:
+        args.model_path = SCENE_FOR_MODE[args.control_mode]
+    model, data, osc = build_sim(
+        args.model_path, randomize_ball=args.randomize_ball, rng=rng,
+        control_mode=args.control_mode,
+    )
 
     decimation = (
         args.decimation if args.decimation is not None
@@ -680,6 +837,17 @@ def main():
     global EEF_MIN_Z
     # Negative = off. 0 is NOT off -- it floors the target at the table top, which still
     # clamps and still puts the hand through the surface. See EEF_MIN_Z.
+    #
+    # In OSC mode the clamp DEFAULTS TO OFF, because the thing it fakes is native here:
+    # verify_osc.py check 4 drives the hand into the table for 120 ticks and measures
+    # 1.11 mm of penetration at 35.4 N, coming to rest 14.7 mm ABOVE the surface, against
+    # the position servo's -2.9 mm at ~70 N. The clamp was always a departure from
+    # LIBERO's control law ("the model asks for a pose and we decline part of it") and it
+    # was already suspected of costing more than it bought -- libero/README.md records a
+    # clamped run that touched the ball zero times against two unclamped runs that
+    # grasped. Pass --min-clearance explicitly to re-enable it for a paired comparison.
+    if args.min_clearance is None:
+        args.min_clearance = -1.0 if args.control_mode == "osc" else DEFAULT_MIN_CLEARANCE
     EEF_MIN_Z = (
         -np.inf if args.min_clearance < 0 else TABLE_TOP_Z + args.min_clearance
     )
@@ -703,6 +871,16 @@ def main():
             break
 
     print(f"checkpoint convention: LIBERO (7-D delta EE pose, [-1,1], norm_tag=libero)")
+    if osc is not None:
+        print(
+            f"control: OSC (robosuite OSC_POSE port), kp={osc.kp[0]:.0f} "
+            f"kd={osc.kd[0]:.2f} uncoupled={osc.uncoupling} "
+            f"nullspace_kp={osc.nullspace_kp:.0f}; ctrl[0:7] = TORQUE"
+        )
+        print(f"  scene: {args.model_path} (<motor> actuators)")
+    else:
+        print("control: Route A (damped-least-squares IK); ctrl[0:7] = JOINT ANGLE")
+        print(f"  scene: {args.model_path} (position servos)")
     print(
         f"sim timestep {model.opt.timestep * 1000:.1f} ms -> {decimation} steps/action "
         f"({decimation * model.opt.timestep * 1000:.1f} ms, "
@@ -861,18 +1039,37 @@ def main():
             )
             ik_failures = 0
             clamped_ticks = 0
+            # OSC-mode analogue of ik_failures: joint-torque commands that hit ctrlrange.
+            # Counted per PHYSICS step (not per action), since that is where the torque is
+            # computed. Persistent saturation means the model is asking for motion this
+            # arm cannot produce.
+            saturated_steps = 0
             cmd_dpos = []
 
             for i, action in enumerate(actions):
-                reached, dpos_norm, was_clamped = apply_action(
-                    model, data, scratch, action, site_id
-                )
+                if osc is not None:
+                    reached, dpos_norm, was_clamped = apply_action_osc(osc, data, action)
+                else:
+                    reached, dpos_norm, was_clamped = apply_action(
+                        model, data, scratch, action, site_id
+                    )
                 clamped_ticks += int(was_clamped)  # int(): numpy bool serializes as a dict
                 if not reached:
                     ik_failures += 1
                 cmd_dpos.append(dpos_norm)
 
+                # THE CONTROL LAW LIVES HERE IN OSC MODE. robosuite recomputes the torque
+                # every physics step (environments/base.py:454 loops over
+                # control_timestep/model_timestep calling the controller each time, with
+                # policy_step=True only on the first), and that is not an optimisation
+                # detail -- holding one torque for a whole 25-step tick would leave the
+                # PD's damping term blind to the velocity it exists to damp, which is a
+                # different and unstable controller. IK mode wrote an absolute joint
+                # target once above and correctly just steps.
                 for _ in range(decimation):
+                    if osc is not None:
+                        data.ctrl[ARM] = osc.compute_torque(model, data)
+                        saturated_steps += osc.last_saturated
                     mujoco.mj_step(model, data)
                     viewer.sync()
 
@@ -902,6 +1099,8 @@ def main():
                 f"mean |dpos| cmd = {np.mean(cmd_dpos) * 1000:.1f} mm"
                 + (f"  IK unreached on {ik_failures}/{len(actions)}" if ik_failures else "")
                 + (f"  table-clamped {clamped_ticks}/{len(actions)}" if clamped_ticks else "")
+                + (f"  torque-saturated on {saturated_steps}/"
+                   f"{len(actions) * decimation * 7} joint-steps" if saturated_steps else "")
             )
 
             log_entry["env_state"]["ctrl_after"] = data.ctrl.tolist()
@@ -911,6 +1110,8 @@ def main():
             )
             log_entry["timing"]["ik_unreached"] = ik_failures
             log_entry["timing"]["table_clamped"] = clamped_ticks
+            log_entry["timing"]["control_mode"] = args.control_mode
+            log_entry["timing"]["torque_saturated_joint_steps"] = saturated_steps
             log_entry["timing"]["mean_cmd_dpos_m"] = float(np.mean(cmd_dpos))
             log_f.write(json.dumps(log_entry) + "\n")
             log_f.flush()

@@ -4,6 +4,17 @@ Self-contained port of the phase-3 closed loop to the **`allenai/MolmoAct2-LIBER
 checkpoint. Deliberately decoupled from `phase3_closed_loop.py` (copy-paste, not import)
 so the DROID path keeps working untouched while this one is in flux.
 
+> **2026-07-28 (later): Route A replaced by a native OSC port — see `PROGRESS.md` §22
+> and "Control" below.** `--control-mode osc` is the default, on the new
+> `scene_libero_osc.xml` (torque actuators). Servo droop, table penetration and
+> `IK unreached` all go away; `--min-clearance` defaults to off. **`a3`/`a4` were
+> collected through Route A and must be regenerated before the next fine-tune** — the
+> collector's rule is that labels come from the controller that consumes them.
+> Also found while doing it: `panda_libero_hand.xml`'s arm gains read menagerie's stock
+> 4500/450 in the *compiled model*, despite its own `ADDITION 6` comment and README §4.1
+> documenting a `kp×2 kd×0.7` stiffening. Untracked file, no history. Verify gains by
+> compiling, not by reading the XML.
+
 > **2026-07-28: four measured scene corrections landed — see `PROGRESS.md` §21.**
 > The table was 100 mm too low relative to the robot base, `grip_site` was 9.5 mm out and
 > yawed 90°, `LIBERO_INIT_QPOS` was not LIBERO's reset pose, and `LIBERO_ORIGIN_OFFSET`
@@ -52,12 +63,71 @@ delta rotation  = action[3:6] * 0.5    radians (axis-angle, world frame)
 So one action is at most 5 cm of translation and 0.5 rad of rotation. At 20 Hz that caps
 the arm at 1 m/s, which is why a full-scale action is a big move, not a nudge.
 
-## Route A: differential IK
+## Control: native OSC (default), or Route A
 
-LIBERO drives the Panda through an operational-space controller (OSC) that converts a
-Cartesian delta into joint torques. We do **not** reimplement OSC (that would mean
-replacing the position actuators with torque actuators and re-tuning gains — see the
-`kp=4500, kd=450` analysis in `phase3_closed_loop.py`). Instead, per control tick:
+> **2026-07-28: `--control-mode osc` is now the default and Route A is the fallback.**
+> The sections below describe both. See `PROGRESS.md` §22 for the port and its
+> verification.
+
+LIBERO drives its Panda with robosuite's `OSC_POSE`, which computes joint **torques**.
+Route A instead solved IK and commanded joint **angles** — the same `data.ctrl` array,
+a different physical quantity. `libero/osc_controller.py` is a port of robosuite
+**1.4.0**'s `OSC_POSE` (the version LIBERO pins; 1.5.2 restructured it and added an
+`input_ref_frame` that 1.4.0 lacks), so the controller now matches the one the
+demonstrations were recorded through.
+
+| | `--control-mode osc` (default) | `--control-mode ik` |
+|---|---|---|
+| scene | `scene_libero_osc.xml` | `scene_libero_hand.xml` |
+| actuators | `<motor>`, `ctrl` = **torque N·m** | position servo, `ctrl` = **rad** |
+| law | `tau = Jᵀ Λ F + qfrc_bias + nullspace` | one DLS IK solve per tick |
+| gains | `kp=150`, critically damped, `uncouple_pos_ori` | n/a |
+| on contact | yields | presses |
+| unreachable | wrench degrades (`pinv`) | `IK unreached` |
+| `--min-clearance` | **off** by default | 16 mm |
+
+A mismatched scene/mode pair is a **hard error**, not a warning: writing torques into
+position actuators reinterprets N·m as radians and produces plausible-looking garbage.
+The check reads the *compiled* model's `actuator_biastype`, not the filename.
+
+### The timing detail
+
+robosuite recomputes the torque **every physics step** — `environments/base.py:454` loops
+`control_timestep/model_timestep` times calling the controller, with `policy_step=True`
+only on the first. So the goal is set at 20 Hz and the PD runs at 500 Hz. Holding one
+torque across a whole 25-step tick is a different and unstable controller, because the
+damping term stops seeing the velocity it exists to damp.
+
+### What it bought, measured
+
+`MUJOCO_GL=egl uv run python libero/tools/verify_osc.py` — four checks, all CPU, free to
+re-run after any change:
+
+| | position servo | OSC |
+|---|---|---|
+| standing sag at reset | 4.84 mm (stock gains) | **0.000 mm** |
+| settled eef above table | 0.2680 | **0.2728** (LIBERO 0.2733) |
+| penetration driving into the table | −2.9 mm at ~70 N | **−1.11 mm at 35.4 N**, rests +14.7 mm above |
+| realised motion per 20 Hz tick | ~33% | **12.3%** |
+
+The first row is the significant one: the top-level `README.md` is *entirely* about a bug
+that exists only because an overdamped position servo never arrives, so the collector's
+`(target − current)` label carried a standing sag into every training frame. That failure
+class does not exist here.
+
+**The last row is not a regression and must not be "fixed".** 12.3% matches the analytic
+step response of a critically damped system at `wn = √150` (12.6%) to within 0.3 points,
+and the policy was trained through exactly this response, so its commanded magnitudes
+already account for it. A value near 100% would mean the port is wrong.
+
+### Route A: differential IK
+
+Kept as `--control-mode ik` so every run and dataset produced before 2026-07-28 stays
+reproducible. It is no longer the default, and the paragraph that used to be here — "we
+do **not** reimplement OSC, that would mean replacing the position actuators with torque
+actuators and re-tuning gains" — is now obsolete: that is exactly what was done, and it
+needed no gain tuning at all, because OSC's own `kp=150` replaces the position gains
+rather than working alongside them. Per control tick:
 
 1. un-normalize the delta: `dpos = a[0:3] * 0.05` m, `drot = a[3:6] * 0.5` rad
 2. add it to the **current measured** `grip_site` pose → target pose. Re-basing on the
@@ -73,10 +143,17 @@ replacing the position actuators with torque actuators and re-tuning gains — s
 5. write the joint solution to `data.ctrl[0:7]`, gripper to `data.ctrl[7]`
 6. step `decimation` physics steps (25 at LIBERO's 20 Hz)
 
-Keeps the existing actuators and scene. `--control-mode` is reserved for adding a real
-OSC path later without touching this one.
+Keeps the existing actuators and scene. ~~`--control-mode` is reserved for adding a real
+OSC path later~~ — **built, see above.**
 
 ### The table floor (`--min-clearance`)
+
+> **Obsolete in `--control-mode osc`, where it defaults to OFF.** Everything below is a
+> description of a workaround for missing compliance, and OSC has compliance natively
+> (−1.11 mm at 35.4 N, coming to rest *above* the surface). Both "known problems" listed
+> at the end of this section — that it does not fully work, and that it may cost more
+> than it buys — are resolved by not needing it. Kept accurate for the `ik` path, and
+> still passable in osc mode if you want a paired comparison under identical constraints.
 
 Route A tracks a commanded **pose** with a stiff position servo; OSC commands **forces**
 and yields on contact. So nothing in this pipeline stops the model asking for a target
@@ -221,11 +298,20 @@ in `panda.xml` for the DROID path.
 
 ```bash
 modal deploy libero/libero_modal.py                       # serve MolmoAct2-LIBERO (L4)
+
+# default: native OSC on scene_libero_osc.xml, table clamp off
 uv run python libero/libero_closed_loop.py --dry-run --server-url <url>/act
 uv run python libero/libero_closed_loop.py --chunks 8 --server-url <url>/act
-uv run python libero/libero_closed_loop.py --chunks 8 --min-clearance -1 --server-url <url>/act
-uv run python libero/libero_closed_loop.py --chunks 8 --image-flip vertical --server-url <url>/act
+
+# the old Route A path, for reproducing pre-2026-07-28 runs
+uv run python libero/libero_closed_loop.py --control-mode ik --chunks 8 --server-url <url>/act
+
+# controller verification -- CPU only, free, run after any change to the OSC path
+MUJOCO_GL=egl uv run python libero/tools/verify_osc.py
 ```
+
+`--model-path` defaults to whichever scene matches `--control-mode`; pass it only to
+override.
 
 Artifacts follow the same layout as phase 3 (`assets/logs/<run_id>.jsonl`,
 `assets/images/<run_id>/`), with `image` / `wrist_image` camera names instead of

@@ -195,6 +195,26 @@ at — raised 100 mm with the table so the view of the work surface is unchanged
 `apply_action`** — the exact function that will consume the fine-tuned model's output at
 inference. Nothing here re-implements the controller.
 
+> **THIS RULE IS CURRENTLY VIOLATED, 2026-07-28.** `libero_closed_loop.py` now defaults
+> to `--control-mode osc` (a port of robosuite's `OSC_POSE`, writing joint torques —
+> `PROGRESS.md` §22), while `a1`–`a4` were all collected through `apply_action`, the
+> Route A IK path. Training on `a4` and serving through OSC is exactly the mismatch this
+> section exists to prevent.
+>
+> **`a4` must be regenerated against OSC before the next fine-tune.** It is free — local
+> CPU, ~20 min — but it is not a re-run with the same flags:
+> - the collector must call the OSC controller, not `apply_action`;
+> - **`NOISE_SIGMA_POS` has to be re-calibrated from scratch.** README §4.3 cut it
+>   0.15 → 0.08 because a stiffer plant realised more of each perturbation per tick; OSC
+>   realises ~12.3% per tick where Route A managed ~33%, so the same sigma delivers a
+>   different physical disturbance again. Carrying 0.08 over would be repeating the
+>   original mistake with new numbers.
+> - the `--min-clearance` clamp is off under OSC, so `reach` and `noise` episodes will no
+>   longer log clamped ticks (§5's table) — compliance handles it instead.
+>
+> The *format* work in this file is unaffected: v3.0, inline PNG, the 8-D state layout,
+> the mirrored gripper pair, the image orientation. Only the episodes change.
+
 That is the whole point. §20's diagnostic scored 3/3 on a real LIBERO task through
 robosuite's OSC, which proved the checkpoint and our serving are both fine and located the
 failure in our environment. A fine-tune can absorb a controller mismatch, but **only** if

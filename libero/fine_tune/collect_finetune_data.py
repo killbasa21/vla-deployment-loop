@@ -12,24 +12,40 @@ DROID checkpoint. This one records what the LIBERO checkpoint speaks:
     rate                  15 Hz                        20 Hz (robosuite control_freq)
     cameras               external_cam, wrist_cam      image, wrist_image
     dataset               LeRobot v2.1 + mp4           LeRobot v3.0 + inline PNG
-    scene                 scene_pick_place.xml         scene_libero_hand.xml
+    scene                 scene_pick_place.xml         --control-mode, see below
 
 THE ONE DESIGN RULE
 -------------------
-Every recorded action is produced by, and executed through, `libero_closed_loop`'s own
-`apply_action` -- the exact function that will consume the fine-tuned model's output at
-inference. Nothing here re-implements the controller.
+Every recorded action is produced by, and executed through, the SAME `libero_closed_loop`
+function that will consume the fine-tuned model's output at inference. Nothing here
+re-implements the controller. `--control-mode` selects which one, on both sides:
+
+    osc (default)  L.apply_action_osc + scene_libero_osc.xml
+                   robosuite's OSC_POSE port, joint torques. What the client defaults to
+                   since 2026-07-28, and what LIBERO itself uses.
+    ik             L.apply_action     + scene_libero_hand.xml
+                   Route A differential IK into position servos. What a1-a4 were
+                   collected on; kept so those datasets stay reproducible.
 
 That is the entire point. The diagnostic in PROGRESS.md sec.20 scored 3/3 on a real LIBERO
 task through robosuite's OSC, which proved the checkpoint and our serving are both fine
-and located the failure in our environment. The leading explanation is controller
-mismatch: the policy learned OSC's compliant transfer function and we drive a stiff
-position servo through IK ("Route A"). A fine-tune can absorb that mismatch, but ONLY if
-the actions it is trained on are the actions that produce the recorded motion in our
-controller. So the expert here is a Cartesian reference trajectory, and the label at each
-tick is the normalised delta from the arm's ACTUAL pose to that reference -- closed-loop,
-not a replayed open-loop plan. Servo lag, IK error and the table clamp all end up inside
-the labels, which is where they have to be for the model to learn to compensate for them.
+and located the failure in our environment. The leading explanation was controller
+mismatch: the policy learned OSC's compliant transfer function and we drove a stiff
+position servo through IK. A fine-tune can absorb that mismatch, but ONLY if the actions it
+is trained on are the actions that produce the recorded motion in our controller. So the
+expert here is a Cartesian reference trajectory, and the label at each tick is the
+normalised delta from the arm's ACTUAL pose to that reference -- closed-loop, not a
+replayed open-loop plan. Tracking lag, controller error and (in ik mode) the table clamp
+all end up inside the labels, which is where they have to be for the model to learn to
+compensate for them.
+
+**A DATASET IS THEREFORE CONTROLLER-SPECIFIC.** An osc dataset and an ik dataset have
+identical schemas and different label VALUES: the two plants realise ~12.3% and ~72% of a
+commanded per-tick displacement respectively, so the corrective deltas differ by ~6x.
+Training on one and serving under the other reintroduces exactly the mismatch above. Every
+plant-calibrated constant in this file (NOISE_SIGMA_POS, RETREAT_BACKOFF*, RECOVER_KICK*,
+and the dwell durations in `waypoints`) was measured on the ik plant and must be
+re-measured, not carried over -- see README.md sec.4.3 for how that sweep is run.
 
 THE THREE COHORTS
 -----------------
@@ -117,6 +133,28 @@ BIN_NAMES = ("green_bin", "blue_bin", "yellow_bin")
 NOISE_SIGMA_POS = 0.08
 NOISE_SIGMA_ROT = 0.021
 
+# ---- OSC-plant defaults -----------------------------------------------------------
+# Everything above this line was measured on the ik plant. OSC is a different plant and
+# needs its own numbers; carrying the ik ones over is the mistake this file's header warns
+# about. Both of these are overridable with --speed-scale / --noise-sigma-pos.
+#
+# OSC_SPEED_SCALE: the ik-era segment durations clip the labels under OSC. Label magnitude
+# is lag/DELTA_POS_SCALE with lag ~= v*dt/realised, so label ~= 8.1*v at 12.3% realised and
+# 20 Hz -- anything above 0.123 m/s saturates. The retreat runs 0.12 m in 0.45 s
+# (0.27 m/s, label 2.2) and the transport ~0.15 m/s (label 1.2). Measured on the unscaled
+# timings under OSC: dx q01 pinned at exactly -1.000 in EVERY cohort, against a4's -0.648
+# and released LIBERO's -0.679. 2.5x puts the worst segment at 0.108 m/s -> label ~0.88,
+# just inside the bound, at the cost of a 27 s episode instead of 10.8 s.
+OSC_SPEED_SCALE = 2.5
+# OSC_NOISE_SIGMA_POS: the ik value of 0.08 does nothing here. Swept on the OSC plant at
+# 8 noise episodes per sigma: 0.08 -> 8/8 placed with 0 rejected attempts, 0.20 -> 8/8 with
+# 0 rejected. A cohort that never fails is a cohort that is not perturbing anything, so
+# both are far below the knee that 0.08 sat on for the ik plant. The ratio argument agrees:
+# holding the REALISED disturbance fixed across 72% -> 12.3% scales sigma by ~5.9x, i.e.
+# 0.08 -> ~0.47.
+OSC_NOISE_SIGMA_POS = 0.47
+OSC_NOISE_SIGMA_ROT = 0.125   # holds the ik plant's 0.267 rot/pos ratio
+
 # Recovery cohort.
 #
 # a1's version was ONE kick of 0.85 placed in the first 45% of the episode, and it was too
@@ -184,8 +222,15 @@ def bin_layout(model, bin_ids, rng):
     return green_xy
 
 
-def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0):
-    """LIBERO's reset pose, plus this episode's ball and bin layout, settled."""
+def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0, osc=None):
+    """LIBERO's reset pose, plus this episode's ball and bin layout, settled.
+
+    `osc` is the OSCController in --control-mode osc, None in ik mode. It changes two
+    things, both mirroring `L.build_sim`:
+      * `data.ctrl[ARM]` is TORQUE, not a joint target, so writing `q` into it would
+        command a constant few N.m instead of a pose.
+      * "hold still" has to be ACTIVELY COMMANDED. With ctrl = 0 the arm is unpowered and
+        falls, so the settling loop below has to run the controller every step."""
     home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if home != -1:
         mujoco.mj_resetDataKeyframe(model, data, home)
@@ -195,7 +240,11 @@ def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0):
         lower, upper = model.jnt_range[:7, 0], model.jnt_range[:7, 1]
         q = np.clip(q + rng.normal(0.0, arm_jitter, size=7), lower, upper)
     data.qpos[:7] = q
-    data.ctrl[L.ARM] = q
+    data.qvel[:] = 0.0   # a previous episode's velocities must not leak into this reset
+    if osc is None:
+        data.ctrl[L.ARM] = q
+    else:
+        data.ctrl[L.ARM] = 0.0
     data.ctrl[7] = L.GRIPPER_CTRL_MAX  # open
 
     for name, pos in [("green_ball", (ball_xy[0], ball_xy[1], BALL_REST_Z)),
@@ -208,8 +257,26 @@ def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0):
         data.qpos[adr + 3:adr + 7] = [1, 0, 0, 0]
 
     mujoco.mj_forward(model, data)
+    if osc is not None:
+        # Park the goal and the nullspace reference on the pose we just wrote, so the
+        # settling loop holds station instead of driving somewhere.
+        osc.reset(data)
     for _ in range(200):
+        if osc is not None:
+            data.ctrl[L.ARM] = osc.compute_torque(model, data)
         mujoco.mj_step(model, data)
+    if osc is not None:
+        # Re-park on the SETTLED pose, so "goal == where we actually are" is exactly true
+        # at the moment the first observation of the episode is taken.
+        osc.reset(data)
+        # ...but pin the NULLSPACE reference to LIBERO's unjittered reset posture, which is
+        # what it will be at inference: build_sim always resets from LIBERO_INIT_QPOS, never
+        # from a jittered pose. Without this the recover cohort (arm_jitter > 0) would have
+        # osc.reset capture the JITTERED joints as the posture the nullspace PD pulls the
+        # elbow toward -- a controller configuration that occurs in 10 of 30 training
+        # episodes and never at serving time. Only the redundant DOF is affected, so eef
+        # labels barely move, but it is a plant difference with no reason to exist.
+        osc.initial_joint = L.LIBERO_INIT_QPOS.copy()
 
 
 def waypoints(ball_xy, bin_xy, start_pos):
@@ -260,8 +327,27 @@ def waypoints(ball_xy, bin_xy, start_pos):
     ]
 
 
-def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz):
+def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_scale=1.0):
     """Expand the waypoints into one (target_pos, gripper) per control tick.
+
+    `speed_scale` multiplies every segment DURATION, so >1 makes the reference slower. It
+    exists because the label magnitude is set by the reference VELOCITY and the plant's
+    tracking lag, not by the geometry:
+
+        label = lag / DELTA_POS_SCALE,  lag ~= v * dt / realised_fraction
+
+    OSC realises 12.3% of a commanded per-tick displacement where the retuned position
+    servo realised 72%, so the SAME reference demands ~6x the corrective delta and the
+    label clips at the +-1 action bound. Measured on the ik-era waypoint timings under OSC:
+    dx q01 pinned at exactly -1.000 in every cohort, against a4's -0.648 and released
+    LIBERO's -0.679. Saturated labels are not a scaling nuisance -- they destroy the
+    gradient's direction information, since every clipped tick reports "full scale" no
+    matter how far off the reference actually is.
+
+    Slowing the reference is the correct lever rather than shrinking the waypoints: the
+    geometry (where the ball is, how high to lift) is task-defined, the timing is not.
+    Solving label <= 1 for v gives v <= DELTA_POS_SCALE * realised / dt = 0.123 m/s, which
+    the ik-era timings exceed on the retreat (0.27 m/s) and the transport (~0.15 m/s).
 
     Seeded from the arm's ACTUAL pose, so the first segment starts wherever the (possibly
     jittered) reset left it.
@@ -278,7 +364,7 @@ def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz):
     prev_pos = data.site_xpos[site_id].copy()
     prev_grip = OPEN
     for target, grip, dur in waypoints(ball_xy, bin_xy, prev_pos):
-        n = max(1, int(round(dur / dt)))
+        n = max(1, int(round(dur * speed_scale / dt)))
         for k in range(1, n + 1):
             a = k / n
             a = a * a * (3.0 - 2.0 * a)
@@ -308,17 +394,19 @@ def expert_action(data, site_id, target_pos, target_mat, grip):
 
 
 def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_body,
-                rng, cohort, control_hz, decimation, ball_xy, bin_xy):
+                rng, cohort, control_hz, decimation, ball_xy, bin_xy, osc=None,
+                speed_scale=1.0):
     """Execute one demonstration. Returns (frames, states, actions, info)."""
     arm_jitter = RECOVER_START_JITTER if cohort == "recover" else 0.0
-    reset_episode(model, data, rng, ball_xy, arm_jitter=arm_jitter)
+    reset_episode(model, data, rng, ball_xy, arm_jitter=arm_jitter, osc=osc)
 
     # Hold the reset orientation throughout: measured against a live LIBERO env, our
     # grip_site at LIBERO's reset joints has axis-angle (3.140, 0, -0.089) against
     # LIBERO's own (3.141, 0.002, -0.090). Top-down, and already in distribution.
     target_mat = data.site_xmat[site_id].copy()
 
-    track = reference_track(model, data, site_id, ball_xy, bin_xy, control_hz)
+    track = reference_track(model, data, site_id, ball_xy, bin_xy, control_hz,
+                            speed_scale=speed_scale)
 
     # Recovery cohort: two shoves, one free-armed during the approach and one loaded
     # during the transport. See RECOVER_KICK_WINDOWS.
@@ -331,6 +419,7 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
     frames = {"image": [], "wrist_image": []}
     states, actions = [], []
     clamped_ticks = 0
+    saturated_steps = 0   # OSC's failure signal, the analogue of ik mode's "IK unreached"
     ball_adr = model.jnt_qposadr[model.body_jntadr[ball_body]]
     max_ball_z = -np.inf
 
@@ -353,9 +442,28 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
             executed[0:3] += kicks[tick] * direction / np.linalg.norm(direction)
         executed = np.clip(executed, -1.0, 1.0)
 
-        _, _, was_clamped = L.apply_action(model, data, scratch, executed, site_id)
+        # THE design rule (see this file's header): the label is executed through the same
+        # function that will consume the model's output at inference, so servo lag and
+        # controller error land inside the labels. That makes the controller choice part of
+        # the dataset -- an OSC dataset and an IK dataset are not interchangeable.
+        if osc is None:
+            _, _, was_clamped = L.apply_action(model, data, scratch, executed, site_id)
+        else:
+            _, _, was_clamped = L.apply_action_osc(osc, data, executed)
         clamped_ticks += int(was_clamped)
         for _ in range(decimation):
+            # Under OSC the torque depends on the live state, so it is recomputed EVERY
+            # physics step, not once per control tick -- robosuite does the same
+            # (environments/base.py calls the controller each sim step, with set_goal
+            # firing only on the first).
+            if osc is not None:
+                data.ctrl[L.ARM] = osc.compute_torque(model, data)
+                # JOINT-steps, not steps-with-any-saturation, so this is directly
+                # comparable with the run-log figure libero_closed_loop.py reports
+                # (denominator: ticks * decimation * 7). Counting them differently under
+                # the same name would silently break the one comparison worth making --
+                # "did the demos need torques the policy also needs".
+                saturated_steps += int(osc.last_saturated)
             mujoco.mj_step(model, data)
         max_ball_z = max(max_ball_z, float(data.qpos[ball_adr + 2]))
 
@@ -369,6 +477,7 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
         "ball_final": ball.tolist(),
         "ball_max_z": max_ball_z,
         "table_clamped_ticks": clamped_ticks,
+        "osc_saturated_steps": saturated_steps,
         "ticks": len(track),
         "kick_ticks": sorted(int(t) for t in kicks),
         "ball_xy": [float(ball_xy[0]), float(ball_xy[1])],
@@ -377,22 +486,30 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
     return frames, np.array(states), np.array(actions), info
 
 
-def selftest(model, data, site_id):
+def selftest(model, data, site_id, osc=None):
     """Print the frame checks that the 2026-07-28 scene corrections were made against.
-    Cheap regression guard: if someone re-edits the scene, these move."""
+    Cheap regression guard: if someone re-edits the scene, these move.
+
+    `osc` must be the controller for whichever --control-mode is active: the settled pose
+    differs between the two plants (the position servo sags under gravity, OSC does not),
+    so running this guard against the wrong one reports numbers no episode will start from."""
     # Go through reset_episode rather than setting qpos[:7] by hand, so this guard reports
     # the state an episode actually starts from (objects placed, arm settled) rather than a
     # near-identical but not identical hand-rolled one. Measured: both paths converge by 50
     # steps and agree to <0.1 mm here, so this is about the guard being the real thing, not
     # about a bug it was hiding.
     #
-    # What this number is NOT: `0.2728` appears in libero/README.md and fine_tune/README.md
-    # as "ours" against LIBERO's 0.2733, i.e. a claimed 0.5 mm match. 0.2728 is the PURE
-    # FORWARD KINEMATICS of LIBERO_INIT_QPOS with no dynamics. The settled pose the arm
-    # actually holds is lower, because the position servo sags under gravity: 0.2680 on
-    # menagerie's stock gains (4.84 mm of sag, so a 5.3 mm error against LIBERO, not
-    # 0.5 mm), and 0.2704 on the kp x2 / kd x0.7 gains this file now runs (2.44 mm).
-    reset_episode(model, data, np.random.default_rng(0), (0.56, 0.0))
+    # What this number is: `0.2728` against LIBERO's 0.2733 is the PURE FORWARD KINEMATICS
+    # of LIBERO_INIT_QPOS. Whether the arm actually HOLDS that pose is plant-dependent, and
+    # that is the whole reason this guard runs through reset_episode:
+    #   osc  -- holds it. Measured 0.2728, i.e. the full 0.5 mm match, because a torque
+    #           controller with gravity compensation has no standing sag.
+    #   ik   -- does not. The position servo sags: 0.2680 on menagerie's stock gains
+    #           (4.84 mm, so a 5.3 mm error against LIBERO, not 0.5 mm), 0.2704 on the
+    #           kp x2 / kd x0.7 gains (2.44 mm).
+    # So the number printed below depends on --control-mode, and only the osc one should be
+    # read as "we match LIBERO".
+    reset_episode(model, data, np.random.default_rng(0), (0.56, 0.0), osc=osc)
     state = L.read_state(model, data, site_id, _finger_adr(model))
     tg = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table_geom")
     top = model.geom_size[tg][2] + data.geom_xpos[tg][2]
@@ -416,6 +533,10 @@ def _finger_adr(model):
 
 
 def main():
+    # Declared up front: the --noise-sigma-* help strings below interpolate these, and
+    # Python rejects `global X` that appears after any use of X in the same function.
+    global NOISE_SIGMA_POS, NOISE_SIGMA_ROT
+
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", default="libero/fine_tune/a1")
@@ -425,7 +546,32 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--render-size", type=int, default=L.RENDER_HEIGHT)
     p.add_argument("--control-hz", type=float, default=L.CONTROL_HZ)
-    p.add_argument("--model-path", default=L.DEFAULT_MODEL_PATH)
+    p.add_argument(
+        "--control-mode", choices=("osc", "ik"), default="osc",
+        help=(
+            "which controller EXECUTES the demonstrations, and therefore which controller "
+            "the labels are written against. Must match what the closed loop will run at "
+            "inference -- see this file's header. 'osc' (default, and the client's default "
+            "too) is the robosuite OSC_POSE port writing joint torques; 'ik' is the "
+            "original Route A differential IK into position servos. The scene follows "
+            "automatically unless --model-path overrides it"
+        ),
+    )
+    p.add_argument(
+        "--model-path", default=None,
+        help="scene XML; defaults to the one matching --control-mode (L.SCENE_FOR_MODE)",
+    )
+    p.add_argument(
+        "--min-clearance", type=float, default=None,
+        help=(
+            "metres the commanded eef target is held above the table top. Default depends "
+            "on --control-mode: OFF for osc, because OSC commands forces and yields on "
+            "contact the way robosuite does, so the Route A clamp is not needed and would "
+            "only teach a constraint inference will not have; "
+            f"{L.DEFAULT_MIN_CLEARANCE} for ik, where position actuators would otherwise "
+            "drive the hand through the surface. Negative disables it (0 does NOT)"
+        ),
+    )
     p.add_argument("--max-attempts-per-episode", type=int, default=8,
                    help="rejection sampling budget; an episode that never lifts the ball "
                         "is resampled rather than kept")
@@ -433,12 +579,78 @@ def main():
                    help="accept episodes that lift the ball but miss the bin. Off by "
                         "default: a demonstration that fails the task is a demonstration "
                         "of failing the task")
+    p.add_argument(
+        "--noise-sigma-pos", type=float, default=None,
+        help=(
+            f"stddev of the Gaussian added to the EXECUTED translation action in the noise "
+            f"cohort (default {NOISE_SIGMA_POS}). This is plant-dependent and must be "
+            "recalibrated whenever the controller changes: sigma perturbs the COMMANDED "
+            "action, but what knocks the arm off the reference is the fraction that gets "
+            "REALISED -- 72% per tick for the retuned position servo a3/a4 were collected "
+            "on, 12.3% for OSC. Carrying a sigma across that change silently changes the "
+            "physical disturbance by ~6x. See README.md sec.4.3 for the sweep that set 0.08"
+        ),
+    )
+    p.add_argument(
+        "--speed-scale", type=float, default=None,
+        help=(
+            "multiplier on every reference-segment DURATION (>1 = slower reference). "
+            "Plant-dependent, like the sigmas: the label is the tracking lag over "
+            "DELTA_POS_SCALE, and lag scales with reference velocity over the plant's "
+            "realised fraction. Default 1.0 for ik (the timings were tuned there) and "
+            f"{OSC_SPEED_SCALE} for osc, whose 12.3%%/tick makes the ik-era timings clip "
+            "the labels at the +-1 bound. See reference_track's docstring"
+        ),
+    )
+    p.add_argument("--noise-sigma-rot", type=float, default=None,
+                   help=f"rotation counterpart of --noise-sigma-pos (default {NOISE_SIGMA_ROT})")
     p.add_argument("--verbose", action="store_true",
                    help="print why each rejected attempt was rejected")
     p.add_argument("--selftest", action="store_true")
     args = p.parse_args()
 
+    if args.model_path is None:
+        args.model_path = L.SCENE_FOR_MODE[args.control_mode]
+
+    # Plant-dependent defaults. These MUST key off --control-mode rather than sitting as
+    # bare module constants: an ik-calibrated sigma under OSC delivers ~1/6 the physical
+    # disturbance, so the noise cohort silently degenerates into a second reach cohort --
+    # near-100% first-attempt keeps, which reads as success while teaching nothing.
+    if args.speed_scale is None:
+        args.speed_scale = OSC_SPEED_SCALE if args.control_mode == "osc" else 1.0
+    if args.noise_sigma_pos is None and args.control_mode == "osc":
+        args.noise_sigma_pos = OSC_NOISE_SIGMA_POS
+    if args.noise_sigma_rot is None and args.control_mode == "osc":
+        args.noise_sigma_rot = OSC_NOISE_SIGMA_ROT
+
+    if args.noise_sigma_pos is not None:
+        NOISE_SIGMA_POS = args.noise_sigma_pos
+    if args.noise_sigma_rot is not None:
+        NOISE_SIGMA_ROT = args.noise_sigma_rot
+
+    # The table clamp is a Route A workaround: it exists because position actuators track a
+    # commanded pose and will press through the surface. OSC yields on contact, so under it
+    # the clamp is both unnecessary and actively harmful -- every clamped tick is a label
+    # teaching a constraint that inference will not impose. Mutating the module global is
+    # how libero_closed_loop.py itself does it; apply_action/apply_action_osc read it.
+    if args.min_clearance is None:
+        args.min_clearance = -1.0 if args.control_mode == "osc" else L.DEFAULT_MIN_CLEARANCE
+    L.EEF_MIN_Z = (-np.inf if args.min_clearance < 0
+                   else L.TABLE_TOP_Z + args.min_clearance)
+
     model = mujoco.MjModel.from_xml_path(args.model_path)
+    # The same guard L.build_sim applies. This file builds its own model rather than going
+    # through build_sim (it needs per-episode resets, not one settled scene), so without
+    # this it would happily write IK joint targets into <motor> actuators -- reinterpreting
+    # N.m as radians and producing a structurally perfect dataset of physical nonsense.
+    if (args.control_mode == "osc") != L.is_torque_actuated(model):
+        raise SystemExit(
+            f"--control-mode {args.control_mode} needs "
+            f"{'torque <motor>' if args.control_mode == 'osc' else 'position servo'} arm "
+            f"actuators, but {args.model_path} has the other kind. Use "
+            f"{L.SCENE_FOR_MODE[args.control_mode]}, or pass the matching --control-mode."
+        )
+
     data = mujoco.MjData(model)
     scratch = mujoco.MjData(model)
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "grip_site")
@@ -446,8 +658,10 @@ def main():
     ball_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "green_ball")
     bin_ids = {n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) for n in BIN_NAMES}
 
+    osc = L.OSCController(model, site_id) if args.control_mode == "osc" else None
+
     if args.selftest:
-        selftest(model, data, site_id)
+        selftest(model, data, site_id, osc=osc)
         return
 
     decimation = int(round((1.0 / model.opt.timestep) / args.control_hz))
@@ -461,11 +675,16 @@ def main():
     )
 
     print(f"scene       : {args.model_path}")
+    print(f"controller  : {args.control_mode}"
+          + ("  (robosuite OSC_POSE port, joint torques)" if osc is not None
+             else "  (Route A differential IK -> position servos)"))
     print(f"control     : {args.control_hz:g} Hz  ({decimation} physics steps/action)")
     print(f"action space: 7-D delta eef pose, [-1,1], {L.DELTA_POS_SCALE} m / "
           f"{L.DELTA_ROT_SCALE} rad per unit")
-    print(f"table floor : eef target clamped to {L.EEF_MIN_Z:+.4f} "
-          f"({L.DEFAULT_MIN_CLEARANCE * 1000:.0f} mm above the top)")
+    print("table floor : DISABLED" if not np.isfinite(L.EEF_MIN_Z)
+          else f"table floor : eef target clamped to {L.EEF_MIN_Z:+.4f} "
+               f"({args.min_clearance * 1000:.0f} mm above the top)")
+    print(f"noise sigma : pos {NOISE_SIGMA_POS}  rot {NOISE_SIGMA_ROT}")
     print(f"out         : {args.out}\n")
 
     plan = ([("reach", i) for i in range(args.reach)]
@@ -486,7 +705,8 @@ def main():
             bin_xy = bin_layout(model, bin_ids, rng)
             frames, states, actions, info = run_episode(
                 model, data, scratch, renderer, site_id, finger_qposadr, ball_body,
-                rng, cohort, args.control_hz, decimation, ball_xy, bin_xy)
+                rng, cohort, args.control_hz, decimation, ball_xy, bin_xy, osc=osc,
+                speed_scale=args.speed_scale)
             if info["lifted"] and (info["placed"] or args.keep_unplaced):
                 kept = (frames, states, actions, info, attempt + 1)
                 break
