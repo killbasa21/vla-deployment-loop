@@ -74,6 +74,11 @@ Usage:
     uv run python libero/libero_closed_loop.py --chunks 20 --image-flip 180 --server-url <url>/act
     uv run python libero/libero_closed_loop.py --control-mode ik \
         --model-path mujoco_menagerie/franka_emika_panda/scene_libero_hand.xml ...
+
+    # serving a fine-tune: the scale and the bin randomisation must match COLLECTION.
+    # a6 was 0.20, a7 is 0.10 -- check the dataset, do not assume.
+    uv run python libero/libero_closed_loop.py --delta-pos-scale 0.10 \
+        --randomize-bins --randomize-ball --chunks 25 --server-url <url>/act
 """
 
 import argparse
@@ -152,6 +157,47 @@ RENDER_WIDTH = 256
 # a nudge. Getting these two numbers wrong scales every motion the model asks for.
 DELTA_POS_SCALE = 0.05   # metres per unit action
 DELTA_ROT_SCALE = 0.5    # radians per unit action (axis-angle, world frame)
+
+# ...but this number also sets the arm's TOP SPEED, and that is what made the first
+# SmolVLA fine-tune slow. The plant tracks a per-tick goal with lag, realising only 12.3%
+# of a commanded delta per 20 Hz tick (see "ONE THING THAT IS NOT AN IMPROVEMENT" above),
+# so the fastest the arm can move without the label clipping at the +-1 bound is
+#
+#     v_max = DELTA_POS_SCALE * realised_fraction / dt = 0.05 * 0.123 * 20 = 0.123 m/s
+#
+# collect_finetune_data.py's OSC_SPEED_SCALE=2.5 respected that ceiling by slowing the
+# EXPERT down: 10.8 s of waypoints stretched to 27 s, i.e. 539 ticks = 54 action chunks
+# per episode, ~19 of them before the grasp even closes. The policy then reproduced that
+# faithfully. The clipping was real; the clock was the wrong knob. Raising the scale
+# raises the ceiling instead (0.125 -> 0.31 m/s, enough for the unscaled timings), and
+# SmolVLA normalises actions MEAN_STD from the dataset's own stats, so the absolute unit
+# is invisible to training -- only saturation is not.
+#
+# The default stays at LIBERO's 0.05 because that is what the STOCK checkpoints
+# (libero_modal.py, stock smolvla_libero) were trained against. Override it with
+# --delta-pos-scale on BOTH the collector and this client, using the same value: the
+# collector divides by it to make the label, this file multiplies by it to execute one,
+# and a mismatch silently rescales every motion the policy asks for.
+DELTA_POS_SCALE_LIBERO = 0.05       # LIBERO's own value, frozen: the reference point that
+                                    # every plant-dependent constant was measured against
+# The paired value for an OSC re-collection, measured on 4 episodes per setting
+# (2 reach / 1 noise / 1 recover, all placed, 0 rejected attempts):
+#
+#   scale   ticks/ep   dx saturated   dx q01
+#   0.05      539         3.07%       -1.000   <- a5, i.e. --speed-scale 2.5
+#   0.125     216         2.20%       -1.000
+#   0.15      216         0.93%       -0.987
+#
+# Note what the top row says: the 2.5x slowdown did not even achieve its own goal. It
+# cost 2.5x the episode length and still left dx pinned at the bound more often than the
+# full-speed collections do, because clipping is set by the scale, not the clock.
+FINE_TUNE_DELTA_POS_SCALE = 0.15
+
+
+def set_delta_pos_scale(scale):
+    """Set the metres-per-unit-action scale for this process (see above)."""
+    global DELTA_POS_SCALE
+    DELTA_POS_SCALE = float(scale)
 
 # Gripper action: the no-op action is [0,0,0,0,0,0,-1], so -1 = open, +1 = closed.
 GRIPPER_ACTION_OPEN = -1.0
@@ -591,7 +637,41 @@ def is_torque_actuated(model):
     return int(model.actuator_biastype[0]) == int(mujoco.mjtBias.mjBIAS_NONE)
 
 
-def build_sim(model_path, randomize_ball=False, rng=None, control_mode="osc"):
+# Bin anchor slots, read off the scene XMLs. These live HERE rather than in
+# collect_finetune_data.py (which imported them from there until 2026-07-31) because both
+# sides need them: the collector shuffles the three bins across these slots every episode,
+# and --randomize-bins below has to draw from the SAME set or the evaluation is not
+# sampling the training distribution.
+BIN_SLOTS = [(0.56, 0.25), (0.56, -0.25), (0.80, 0.0)]
+BIN_SLOT_JITTER = 0.02
+BIN_NAMES = ("green_bin", "blue_bin", "yellow_bin")
+
+
+def randomize_bins(model, rng):
+    """Shuffle the three bins across BIN_SLOTS with jitter. Returns green's (x, y).
+
+    The counterpart of collect_finetune_data.py's `bin_layout`, and it exists because
+    without it the two sides disagree: the collector randomises bins on every episode
+    while the closed loop always ran the scene XML's single layout, so in a5 the only
+    configuration ever evaluated was 6 of 30 training episodes and the colour-grounding
+    the shuffle buys was never exercised. Randomise both, or pin both
+    (--bin-layout scene); the one thing that is not defensible is randomising only one.
+    """
+    green_xy = None
+    for name, slot_idx in zip(BIN_NAMES, rng.permutation(len(BIN_SLOTS))):
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if bid == -1:
+            continue
+        x, y = BIN_SLOTS[slot_idx]
+        jx, jy = rng.uniform(-BIN_SLOT_JITTER, BIN_SLOT_JITTER, size=2)
+        model.body_pos[bid] = [x + jx, y + jy, TABLE_TOP_Z]
+        if name == "green_bin":
+            green_xy = (float(x + jx), float(y + jy))
+    return green_xy
+
+
+def build_sim(model_path, randomize_ball=False, rng=None, control_mode="osc",
+              randomize_bin_layout=False):
     """Returns (model, data, osc). `osc` is None in ik mode."""
     model = mujoco.MjModel.from_xml_path(model_path)
     data = mujoco.MjData(model)
@@ -623,6 +703,11 @@ def build_sim(model_path, randomize_ball=False, rng=None, control_mode="osc"):
         # the keyframe's value would just drag the arm back to the old pose on step 1.
         data.ctrl[ARM] = LIBERO_INIT_QPOS
     data.ctrl[7] = GRIPPER_CTRL_MAX  # gripper open (stock hand: 255 = open)
+
+    # Before the free bodies: the bins are static, so this only touches model.body_pos and
+    # the mj_forward below picks it up.
+    if randomize_bin_layout and rng is not None:
+        randomize_bins(model, rng)
 
     for name, pos in FREE_BODY_INITIAL_POSES.items():
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
@@ -749,6 +834,24 @@ def main():
     parser.add_argument("--assets-dir", default="assets")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--randomize-ball", action="store_true")
+    parser.add_argument(
+        "--randomize-bins", action="store_true",
+        help=(
+            "shuffle the three bins across BIN_SLOTS with jitter at reset, the way the "
+            "collector does every episode. OFF by default, which is what every run before "
+            "2026-07-31 did -- and that is exactly the mismatch worth knowing about: the "
+            "training data varies the bin layout and the evaluation never did, so one "
+            "layout carried all the eval weight while the policy spent most of its "
+            "training reaching toward bins that were not on the table at inference. Turn "
+            "this on to evaluate the distribution actually trained on. "
+            "SCORING: this MOVES the green bin, so a placement can only be judged against "
+            "the position this run actually used, not the scene XML's. That position is "
+            "written into every log entry as `green_bin_xy` and score_runs.py prefers it. "
+            "Logs from before 2026-08-01 have no such field, so score_runs.py falls back "
+            "to the XML and flags the run `(XML)` -- for a randomised run that fallback is "
+            "WRONG (the bin can be 500 mm away) and `placed` means nothing"
+        ),
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--payload-keys", choices=tuple(PAYLOAD_KEY_SETS), default="droid",
@@ -816,16 +919,47 @@ def main():
     )
     parser.add_argument("--query-interval", type=float, default=0.0,
                         help="minimum seconds between queries; 0 disables throttling")
+    parser.add_argument(
+        "--delta-pos-scale", type=float, default=DELTA_POS_SCALE,
+        help=(
+            f"metres per unit action. MUST match the value the served checkpoint's "
+            f"dataset was collected at -- a mismatch rescales every motion. Default "
+            f"{DELTA_POS_SCALE} is LIBERO's own, correct for the stock checkpoints; a "
+            f"re-collection for speed uses {FINE_TUNE_DELTA_POS_SCALE} on both sides"
+        ),
+    )
+    parser.add_argument(
+        "--action-scale", type=float, default=1.0,
+        help=(
+            "gain on the policy's translation+rotation deltas before they are executed, "
+            "clipped back to [-1, 1] afterwards. NOT a training-matched knob -- it "
+            "deliberately drives the arm off the trajectory the policy was trained on. "
+            "It exists to test, without retraining, whether a sluggish run is the policy "
+            "emitting small deltas (a gain of ~2 visibly speeds it up) or something else"
+        ),
+    )
     args = parser.parse_args()
 
+    set_delta_pos_scale(args.delta_pos_scale)
+    if args.action_scale <= 0:
+        parser.error("--action-scale must be > 0")
+
     send_wrist = not args.no_wrist_to_model
-    rng = np.random.default_rng(args.seed) if args.randomize_ball else None
+    rng = (np.random.default_rng(args.seed)
+           if (args.randomize_ball or args.randomize_bins) else None)
     if args.model_path is None:
         args.model_path = SCENE_FOR_MODE[args.control_mode]
     model, data, osc = build_sim(
         args.model_path, randomize_ball=args.randomize_ball, rng=rng,
-        control_mode=args.control_mode,
+        control_mode=args.control_mode, randomize_bin_layout=args.randomize_bins,
     )
+
+    # Read the green bin off the BUILT model, not the XML: with --randomize-bins the two
+    # disagree, and the built model is the one the run actually happens in. Logged on every
+    # entry so scoring never has to guess the layout after the fact.
+    _green_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "green_bin")
+    green_bin_xy = (None if _green_bid == -1
+                    else [float(v) for v in model.body_pos[_green_bid][:2]])
 
     decimation = (
         args.decimation if args.decimation is not None
@@ -886,7 +1020,11 @@ def main():
         f"({decimation * model.opt.timestep * 1000:.1f} ms, "
         f"{1.0 / (decimation * model.opt.timestep):.2f} Hz control)"
     )
-    print(f"delta scale: {DELTA_POS_SCALE} m, {DELTA_ROT_SCALE} rad per unit action")
+    print(f"delta scale: {DELTA_POS_SCALE} m, {DELTA_ROT_SCALE} rad per unit action"
+          f"  (v_max ~ {DELTA_POS_SCALE * 0.123 * CONTROL_HZ:.3f} m/s under OSC)")
+    if args.action_scale != 1.0:
+        print(f"action gain: x{args.action_scale} on channels 0-5 -- OFF-DISTRIBUTION, "
+              "diagnostic only")
     print(
         "table floor: DISABLED (negative --min-clearance)"
         if args.min_clearance < 0
@@ -911,6 +1049,21 @@ def main():
     if not args.dry_run:
         images_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / f"{run_id}.jsonl"
+    # Say out loud which scene layout this run is scored against. Bin randomisation is
+    # opt-in (--randomize-bins, off by default), but "off by default" is not the same as
+    # "visible", and a run whose placement target moved is not comparable to one whose did
+    # not. Printing the actual position makes the two distinguishable in a terminal
+    # scrollback as well as in the log.
+    if green_bin_xy is None:
+        print("green bin: NOT IN SCENE -- placement cannot be scored")
+    elif args.randomize_bins:
+        print(f"green bin: ({green_bin_xy[0]:.3f}, {green_bin_xy[1]:.3f}) "
+              f"-- RANDOMISED this run (--randomize-bins); scoring must use the logged "
+              f"green_bin_xy, not the scene XML")
+    else:
+        print(f"green bin: ({green_bin_xy[0]:.3f}, {green_bin_xy[1]:.3f}) "
+              f"-- scene XML layout, bins not randomised")
+
     print(f"run_id: {run_id}\n  log:    {log_path}\n  images: {images_dir}/")
 
     executor = None if args.dry_run else ThreadPoolExecutor(max_workers=1)
@@ -1005,6 +1158,20 @@ def main():
                 "chunk": chunk_i,
                 "timestamp": time.time(),
                 "convention": "libero_delta_eef",
+                # The green bin's ACTUAL position in this run. --randomize-bins mutates
+                # model.body_pos at build time, so a scorer that re-reads the scene XML gets
+                # the unshuffled layout and tests the placement against the wrong bin -- and
+                # nothing in the log made the real position recoverable afterwards. Written
+                # on every line rather than once, so the file stays self-contained under
+                # `tail -f` like the rest of this format. See score_runs.green_bin_xy.
+                "green_bin_xy": green_bin_xy,
+                # How many chunks this run was ASKED for. Without it there is no way to tell
+                # a finished 40-chunk run from one that is still in flight or was killed --
+                # and score_runs.py reads logs while they are being written (the file is
+                # flushed every entry on purpose). A partial log scores as `released=False`,
+                # i.e. a policy failure, which is exactly the wrong conclusion. 0 = "until
+                # killed", where no completeness claim is possible.
+                "chunks_requested": args.chunks,
                 "env_state": env_state_before,
                 "model_output": {
                     "actions": actions.tolist(),
@@ -1016,6 +1183,8 @@ def main():
                     "replan_at": args.replan_at,
                     "staleness_ticks": stale,
                     "actions_executed": len(actions),
+                    "delta_pos_scale": DELTA_POS_SCALE,
+                    "action_scale": args.action_scale,
                 },
                 "network": {
                     "url": args.server_url,
@@ -1047,6 +1216,12 @@ def main():
             cmd_dpos = []
 
             for i, action in enumerate(actions):
+                if args.action_scale != 1.0:
+                    # Pose channels only. The gripper channel is a SWITCH, not a
+                    # magnitude: scaling it would turn a half-open command into a fully
+                    # closed one and change what the run is doing, not how fast.
+                    action = np.asarray(action, dtype=np.float64).copy()
+                    action[0:6] = np.clip(action[0:6] * args.action_scale, -1.0, 1.0)
                 if osc is not None:
                     reached, dpos_norm, was_clamped = apply_action_osc(osc, data, action)
                 else:

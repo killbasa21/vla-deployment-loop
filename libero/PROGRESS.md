@@ -1083,6 +1083,370 @@ realised more of each perturbation, and OSC's per-tick response is different aga
 
 ---
 
+## 23. The SmolVLA fine-tune was slow because the expert was — two knobs, one ceiling
+
+**Tried.** The first SmolVLA fine-tune (on `a5`) does the task: it approaches, grasps,
+transports, places. It just takes ~54 action chunks to get there. Looked for the cause in
+the policy, the chunk horizon, and the serving path. It was in none of them — it was in
+the dataset, and it was visible without running anything:
+
+```
+a5: 16170 frames / 30 episodes = 539 ticks = 27 s per episode   (a4 was 216 ticks / 10.8 s)
+```
+
+The grasp closes around tick 190, i.e. chunk 19. **The policy is reproducing its expert
+faithfully. The expert is slow.** Behaviour cloning has no notion of "do this, but
+quicker"; episode duration is a property of the data, not a hyperparameter.
+
+**Where the 2.5× came from, and why it was defensible.** `OSC_SPEED_SCALE = 2.5`
+multiplies every waypoint duration. It was introduced with §22's OSC port because the
+label is the tracking lag over `DELTA_POS_SCALE`, and OSC realises only 12.3% of a
+commanded delta per tick:
+
+```
+label = lag / DELTA_POS_SCALE,   lag ~= v * dt / realised
+v_max = DELTA_POS_SCALE * realised / dt = 0.05 * 0.123 * 20 = 0.123 m/s
+```
+
+The ik-era timings exceed that on the retreat (0.27 m/s), so `dx` pinned at −1.000 in
+every cohort. Saturated labels destroy direction information — every clipped tick reports
+"full scale" regardless of the true error — so the concern was real and correctly
+identified.
+
+**Result: the fix did not work, and cost 2.5× the episode length to not work.** Measured
+on `a5` itself: `dx` is still saturated on **3.07%** of frames, `q01` still exactly
+−1.000. Slowing the reference lowers the lag *and* the ticks-per-metre proportionally, so
+past a point it buys nothing — the ceiling is set by the action **scale**, not the clock.
+Two knobs, one constraint, and the clock was the wrong one:
+
+| | | ticks/ep | dx saturated | dx q01 |
+|---|---|---|---|---|
+| `a5` | scale 0.05, speed-scale 2.5 | 539 | 3.07% | −1.000 |
+| | scale 0.125, hand-set timings | 216 | 2.20% | −1.000 |
+| | scale 0.15, hand-set timings | 216 | 0.93% | −0.987 |
+
+Raising `DELTA_POS_SCALE` raises the arm's top speed instead of lowering the expert's, and
+SmolVLA normalises actions MEAN_STD from the dataset's own stats — so the absolute unit is
+invisible to training. Only saturation is not.
+
+**Then: the timings were uneven, which neither knob addresses.** Printing per-segment mean
+speed against the ceiling showed the durations had never been set against a speed budget
+at all:
+
+| segment | dist | mean v | vs 0.246 m/s budget @ scale 0.15 |
+|---|---|---|---|
+| retreat / re-approach | 0.124 m | 0.275 | **over** — this is the residual clipping |
+| closing return to start | 0.285 m | 0.285 | **over** |
+| descent onto the ball | 0.100 m | 0.125 | half the budget — wasted ticks |
+| transport | 0.252 m | 0.126 | half the budget — wasted ticks |
+
+So the same trajectory simultaneously clipped labels *and* crawled. `--motion-speed`
+retimes every motion segment to one target mean speed, leaving dwells alone (they are
+settling and gripper-actuation time, set by physics, not distance). The default is 0.90 ×
+the ceiling ÷ 1.5, the 1.5 being smoothstep's peak-over-mean.
+
+**Result, 4 episodes per setting, all placed:**
+
+| scale | motion speed | ticks/ep | dx saturated | dx q01 | OSC torque saturation |
+|---|---|---|---|---|---|
+| 0.15 | 0.221 | 194 | **0.00%** | −0.768 | 0.05% of steps |
+| **0.20** | **0.295** | **161** | **0.00%** | **−0.681** | 0.11% |
+| 0.25 | 0.369 | 136 | 0.00% | −0.618 | 0.14% |
+| 0.30 | 0.443 | 126 | 0.00% | −0.553 | 0.21% |
+
+Retiming removes the clipping **entirely** at every scale — the unevenness was the whole
+of the residual, not the scale. Chose **0.20**: `dx q01 = −0.681` against released LIBERO's
+−0.679, i.e. a near-exact match to the distribution the checkpoint was pretrained on, at
+**161 ticks — 3.3× shorter than `a5`**. Past 0.25 the returns collapse (136 → 126 ticks for
+20% more scale) while the label distribution thins and torque saturation climbs.
+
+**The learning worth keeping.** Three constants were tuned against each other without a
+shared frame: `DELTA_POS_SCALE` (what one action unit means), the waypoint durations (how
+fast the expert moves), and `OSC_SPEED_SCALE` (a correction bolted onto the second when the
+plant changed). They all resolve to one physical quantity — commanded speed against
+`v_max = scale * realised / dt` — and none of them was written in those terms, so the
+correction landed on the knob that was easiest to reach rather than the one that binds.
+**When a constant gets a correction factor, check whether the correction belongs to a
+different constant.** The tell here was available from the start and unread: `a5` was
+collected specifically to stop `dx` clipping, and its own `stats.json` shows `dx` min =
+−1.000.
+
+### 23.1 The bins were randomised on one side only
+
+Found while checking the above. `bin_layout()` permutes green/blue/yellow across three
+slots with ±2 cm jitter every episode, so the policy has to find green by colour.
+`libero_closed_loop.py` had `--randomize-ball` and **no bin equivalent** — every run since
+the scene was built evaluated the XML's single layout, green at (0.56, 0.25). In `a5` that
+layout drew **6 of 30 episodes**:
+
+| green bin at | a5 episodes | ever evaluated? |
+|---|---|---|
+| (0.80, 0.00) | 14 | no |
+| (0.56, −0.25) | 7 | no |
+| (0.56, +0.25) | 6 | **yes — all of it** |
+| jittered variants | 3 | no |
+
+So 80% of training taught reaching toward bins that are not on the table at inference, and
+the colour-grounding the shuffle exists to buy was never once tested. Not a bug in either
+file — a disagreement between two files that each looked correct alone, and the kind that
+cannot produce an error message. `--randomize-bins` now exists on the client, drawing from
+`BIN_SLOTS` **imported from** `libero_closed_loop.py` rather than a second copy;
+`--bin-layout scene` is the opposite resolution (pin both) if colour grounding is not the
+goal. Randomise both or pin both; randomising one is the only indefensible option.
+
+**Generalises past this repo:** domain randomisation is a property of the *pair*, not of
+the collector. Any axis randomised in training and fixed at evaluation silently converts
+into wasted sample budget, and the eval still passes — it just measures one draw.
+
+### 23.2 `a6` as collected
+
+30 episodes (10 reach / 10 noise / 10 recover), scale 0.20, distance-retimed, shuffled
+bins, seed 0. **30/30 placed, 1 rejected attempt, 447 s of CPU.**
+
+| | `a4` | `a5` | **`a6`** |
+|---|---|---|---|
+| ticks / episode | 216 | 539 | **161** |
+| frames | 19440 | 16170 | 4825 |
+| dx saturated | 0.35% | 3.07% | **0.00%** |
+| dx q01 (released LIBERO: −0.679) | −0.679 | −1.000 | **−0.807** |
+| plant | ik | osc | osc |
+
+**One thing the 4-episode sweep missed, because I was only checking the translation
+channels: `ry` saturates on 0.54% of frames** (std 0.146 against `a4`'s 0.031). Cause is
+mine — I raised `DELTA_POS_SCALE` and left `DELTA_ROT_SCALE` at 0.5, so faster motion makes
+the wrist's orientation lag further while the divisor stayed put. All 26 saturated frames
+land at **episode fraction 0.96-0.99**, i.e. inside the closing return-to-start, after the
+ball is already in the bin. Shipped as-is: it is post-task, and `--delta-rot-scale` would
+be a second wire convention to keep in sync across two processes for no task-relevant gain.
+Worth revisiting only if the retrain shows orientation problems on the return.
+
+**Method note.** The sweep that chose 0.20 printed `dx` and `dz` saturation and called the
+setting clean. A per-channel check over all six would have caught `ry` before the
+collection ran, not after. When a change scales one axis of an action space, the summary
+has to cover the axes that were *not* scaled — those are where the coupled error shows up.
+
+### 23.3 `--policy.use_peft=true` never created a LoRA
+
+The first `a6` training smoke died 29 s in, before any GPU work:
+
+```
+ValueError: Can't find 'adapter_config.json' at 'HuggingFaceVLA/smolvla_libero'
+```
+
+`--policy.use_peft=true` had been in `smolvla_modal_train.py`'s `lora` mode since it was
+written, with a comment asserting it was "SmolVLAConfig's own switch ... confirmed against
+the installed 0.6.0 dataclass fields". The field exists; it does not mean what the comment
+assumed. In lerobot 0.6.0 `factory.make_policy` reads it as *"this checkpoint IS a PEFT
+adapter — load it"*, so it looks for an `adapter_config.json` beside the base checkpoint
+and dies when the stock policy has none. Creating a **new** adapter is a top-level train
+field, `--peft.*`, which `lerobot_train.py` turns into `policy.wrap_with_peft(...)` — and
+that call sets `config.use_peft = True` itself on the way out, which is what makes the
+saved checkpoint loadable with `use_peft` later. Passing it on the way in is the error.
+
+Confirming the field exists is not confirming what it does. The dataclass check that was
+run would pass identically for both meanings.
+
+Second thing the fix surfaced: SmolVLA's default LoRA targets are
+
+```
+(model.vlm_with_expert.lm_expert.*.(q|v)_proj | model.(state_proj|action_*_proj|action_time_mlp_*))
+```
+
+— the **action expert's** attention projections and the state/action heads, and *not* the
+VLM. So `lora` mode never adapted the VLM the way its comment claimed. Left at the default
+deliberately: episode speed is encoded in action magnitudes, which is the expert's job, not
+a grounding problem the VLM has to relearn. `freeze_vision_encoder` / `train_expert_only`
+were dropped from the mode at the same time — `wrap_with_peft` calls `requires_grad_(False)`
+on every base parameter regardless, so they were dead flags that read as live ones.
+
+Second smoke passed: PEFT wrapped, **2.35 M trainable of 607 M**, 4825 frames / 30
+episodes, one step, checkpoint saved, 65 s wall.
+
+### 23.4 The `a6` retrain
+
+5000 steps, batch 16 (16.6 epochs over a6), LoRA r=32 on SmolVLA's default targets, L4,
+50m35s at 1.65 step/s, exit 0. Checkpoints every 1000 on
+`molmoact2-checkpoints:/smolvla/smolvla-a6-lora/checkpoints/`.
+
+| step | epoch | loss | grdn | lr |
+|---|---|---|---|---|
+| 200 | 0.66 | 1.313 | 0.254 | 1.0e-05 |
+| 1000 | 3.98 | 0.617 | 0.333 | 8.9e-05 |
+| 2000 | 7.30 | 0.492 | 0.427 | 6.3e-05 |
+| 3000 | 10.61 | 0.440 | 0.458 | 3.3e-05 |
+| 4000 | 13.93 | 0.429 | 0.473 | 1.0e-05 |
+
+Flat by 3000 (0.440 → 0.429 over the next 1000 steps, with the LR already decayed to
+floor), so the last fifth of the run bought nothing measurable.
+
+**This is training loss on 30 episodes with no held-out split.** It says the adapter fit
+`a6`; it says nothing about closed-loop behaviour, and `a5`'s fine-tune also trained
+cleanly before serving slow. The 3000 and 4000 checkpoints are the A/B candidates if 5000
+disappoints — with 3.3x fewer frames than `a5` at the same step count, overfitting is now
+the plausible failure where `a5` was underfitting.
+
+### 23.5 The retrain IS fast, and it misses the ball
+
+Served checkpoint 005000 (and 003000) through `smolvla_modal.py` on a T4 and ran the closed
+loop at `--delta-pos-scale 0.20`. Serving needed one change: a fine-tune is a LoRA
+**adapter**, so `load()` now branches on `adapter_config.json` existing -- base policy from
+`base_model_name_or_path`, adapter applied, `merge_and_unload()`. Note the symmetry with
+sec.23.3: `use_peft=true` was wrong at TRAIN time (no adapter existed yet) and is right at
+SERVE time (one does), which is why the branch tests for the file rather than a flag.
+
+**The speed problem is solved.** Both runs execute the entire pick-place-return sequence in
+~20 chunks against `a5`'s ~54, with the phases in the right order and the right proportions:
+
+| | close gripper | lift | at bin | released | back at start |
+|---|---|---|---|---|---|
+| `a5`-trained (reported) | ~chunk 19 | — | — | — | — |
+| `a6` ck5000 | chunk 3-4 | chunk 5 | chunk 8 | chunk 15-16 | chunk 18-19 |
+
+**And the ball never moves.** Three runs, `tracked_object_xpos` identical at the first and
+last chunk in all three:
+
+| run | ball | first close | eef at close | lateral err | vertical |
+|---|---|---|---|---|---|
+| ck5000, randomised ball | (0.569, 0.104) | chunk 10 | (0.605, 0.024, 0.004) | **88 mm** | on the table |
+| ck5000, nominal ball | (0.560, 0.000) | chunk 3 | (0.526, 0.010, 0.007) | **36 mm** | on the table |
+| ck3000, nominal ball | (0.560, 0.000) | chunk 4 | (0.570, 0.004, 0.048) | **11 mm** | **40 mm high** |
+
+So the policy has learned the *shape* of the task and the *timing* of it, and closes on
+air. ck3000 is laterally three times more accurate than ck5000 (11 mm vs 36 mm), which is
+what over-training on 30 episodes looks like — but it stops its descent 40 mm above the
+ball, so it fails too.
+
+**Leading explanation, and it is a cost of sec.23's own fix.** One action unit is now
+0.20 m instead of LIBERO's 0.05, so every action the policy emits is **4x coarser in
+metres**. The label distribution shrank to match — measured across the scale sweep, dx std
+went 0.232 (scale 0.15) -> 0.154 (scale 0.30) — and terminal positioning is exactly where
+the residual error is smallest and therefore where the labels are closest to zero. A 10 mm
+correction was a 0.20 action at LIBERO's scale and is a 0.05 action at ours.
+
+The decisive comparison is the one already in hand: **`a5` was slow and grasped the ball;
+`a6` is fast and misses it.** Same scene, same collector, same cohorts, same plant. What
+changed between them is the scale and the timing.
+
+Quantified, this is not hand-waving. Under MEAN_STD normalisation the metres an action
+carries per unit of *normalised* policy error is `std(dx) * DELTA_POS_SCALE`:
+
+| dataset | scale | ticks/ep | dx std | mm per 1.0 normalised error |
+|---|---|---|---|---|
+| a4 | 0.05 | 216 | 0.205 | 10.2 |
+| **a5** (slow, **grasps**) | 0.05 | 539 | 0.309 | **15.5** |
+| sweep | 0.15 | 194 | 0.232 | 34.8 |
+| **a6** (fast, **misses**) | 0.20 | 160 | 0.200 | **40.0** |
+| sweep | 0.30 | 126 | 0.154 | 46.1 |
+
+`a6`'s measured 36 mm miss is ~0.9 units of normalised error. The same 0.9 at `a5`'s
+resolution is 14 mm — inside the ball's 20 mm radius, i.e. a grasp. The
+`a5`-grasps/`a6`-misses split falls out of this table with no additional assumption, and
+the ratio (2.6x) is not something a policy trained longer can recover: it is the units.
+
+So there is a **speed/precision frontier** here, set by the plant's 12.3% realised
+fraction, and sec.23 moved along it rather than beating it. 0.20 is past the knee.
+
+If that reading is right, the fix is a middle setting rather than a return to 0.05. At `--delta-pos-scale 0.10`, `--motion-speed` retiming gives
+~0.147 m/s and ~256 ticks/episode: still 2x faster than `a5`, with 2x the terminal
+resolution of `a6`. Not yet run.
+
+**The competing explanation has not been excluded**: 30 episodes may simply be too few for
+reliable grounding, in which case the scale is innocent and the fix is more data or a LoRA
+that actually adapts the VLM (sec.23.3 -- the current one targets only the action expert).
+A run of `a6` at `--delta-pos-scale 0.05` would separate these: if a scale the model was
+not trained at still grasps better, the coarseness reading is wrong.
+
+**Procedural note.** The first ck3000 run was thrown away: `modal deploy` returned in 6 s
+and `/health` still reported ck5000, because the previous container was inside its 300 s
+`scaledown_window` and answered from the old deployment. A deploy is not a cutover. Poll
+`/health` until it reports the checkpoint you meant to test — and note that the discarded
+run showed the ball moving 178 mm, i.e. it looked like the most successful run of the set.
+Contaminated results do not announce themselves by looking wrong.
+
+ The failure mode this cannot fix is a
+policy that is slow because it is *uncertain* — hedging toward a small action because the
+chunk distribution is multimodal — and that would look identical from the outside. If `a6`
+retrains to ~161-tick episodes, the diagnosis holds; if it stays at 500+, the slowness was
+never the expert's.
+
+---
+
+## 24. `a7` collection killed the terminal twice — the writer holds every raw frame
+
+**Symptom.** Two `a7` runs (60 episodes) simulated all 60 episodes, printed every
+`ticks=... placed=1` line, and then died without writing `stats.json` or `cohorts.json`.
+Disk was never the problem: 69 GB free throughout. Nothing appeared in the kernel log,
+which is why it read as "the terminal crashed" rather than as an OOM.
+
+**Cause.** `lerobot_v30_writer.py` buffers **raw uint8 frames** for every episode until
+`finalize()`, and its own docstring said so: *"a few hundred MB for the 50-ish short
+episodes this is used for; it would need a streaming rewrite for thousands."* a7 is not
+thousands of episodes, but it is 4x a6's frames, and the frames are what matter:
+
+| | frames | x2 cameras, raw @ 196.6 kB | fits in 15 GB? |
+|---|---|---|---|
+| a6 | 4825 | 1.9 GB | yes |
+| a5 | 16170 | 6.4 GB | just |
+| **a7** | **20034** | **7.9 GB** | **no** |
+
+Then `finalize()` asks for more, on top of that 7.9 GB: PNG-encoding every frame into
+Arrow buffers, and `_image_stats` materialising `np.asarray(frames, np.float32) / 255.0`
+— a float32 copy 4x the size of the uint8 it comes from, 0.26 GB per camera per 334-frame
+episode, and a 3.1 GB spike for the dataset-wide pass. It died at the single most
+expensive moment available: after every episode had been simulated, before anything was
+recoverable.
+
+**Fix — encode and measure at ingest.** `add_episode` now PNG-encodes each frame while the
+caller still holds it and stores only the bytes, and folds the same frame into a streaming
+`ImageStatsAccumulator` (sum / sumsq / min / max in float64, O(1) memory). Nothing raw
+survives the call.
+
+```
+raw uint8 256x256x3   196.6 kB/frame      a7: 7.9 GB
+PNG of this scene      ~12   kB/frame      a7: ~0.5 GB   <- 16x
+```
+
+Encoding at ingest is not extra work — every frame is PNG-encoded exactly once either
+way. It just happens spread out instead of in one spike. Measured on a 4-episode /
+1340-frame collection: **peak RSS 780 MB**.
+
+Two things fell out of the rewrite:
+
+- **The old image stats were less accurate, not more.** Summing 3.2M pixels in float32
+  loses precision: against an exact float64 reference the old path errs 1.5e-05 on the
+  mean and 2.9e-04 on the std, the accumulator 2.7e-14 and 5.3e-13. The "mismatch" when
+  comparing old against new is the old code.
+- **`_image_stats`'s docstring described an optimisation that was not in the code** —
+  "frames are subsampled because the exact mean of every pixel of every frame is not worth
+  the memory", in a function that converted all of them. The dataset-wide pass did
+  subsample (every 5th frame); the per-episode one never did. The accumulator makes the
+  question moot and the global stats now cover every frame.
+
+### 24.1 The dead `a7` was recovered rather than re-collected
+
+A parallel agent wrote `libero/fine_tune/rebuild_stats.py`, which recomputes `stats.json`
+from the parquets, and repaired the tree. Its reasoning matched this section's
+independently, but "the parquets are complete and authoritative" is exactly the claim a
+crash *during the parquet-writing stage* puts in doubt, so it was checked rather than
+taken:
+
+- 20034 rows = `info.total_frames`; episodes 0..59 all present
+- per-episode lengths match `meta/episodes`; `index` contiguous 0..N-1; `frame_index`
+  restarts at 0 per episode
+- frames decode at (256,256,3) **including the last three rows**, where a truncated write
+  would show
+- rebuilt `stats.json` matches the data to float32 precision (action mean 1.0e-08)
+
+Complete. `meta/cohorts.json` is not recoverable — it lives only in the collector's memory
+— so `a7` cannot be split by cohort for ablations, which no training or serving path needs.
+
+**`a7` as it stands:** 60 episodes, 20034 frames, scale 0.10, 334 ticks/episode.
+Resolution 23.5 mm per unit of normalised error, between `a5`'s 15.5 and `a6`'s 40.0.
+`dx` clips on 1.35% of frames against `a5`'s 3.07% — the noise cohort's sigma scales
+inversely with the action scale, so a lower scale perturbs harder in action units.
+
+---
+
 ## Corrections to `PHASE5_PLAN.md`
 
 Things the plan asserts that later measurement contradicted:
@@ -1142,9 +1506,20 @@ Things the plan asserts that later measurement contradicted:
 - **The grasp closes ~1.6 mm below the ball's equator** (§22.1), down from ~7 mm. That is
   the remaining mechanical gap between "shoves the ball" and "lifts it", and it is now
   small enough to be worth a deliberate sweep of where the eef arrests.
-- **`a3`/`a4` are controller-mismatched** (§22). Collected through Route A, but the client
-  now serves through OSC, breaking the collector's one design rule. Regenerate against OSC
-  and **re-calibrate `NOISE_SIGMA_POS`** rather than reusing 0.08.
+- ~~**`a3`/`a4` are controller-mismatched**~~ **DONE**: `a5` was the OSC re-collection, and
+  `a6` (§23) supersedes it — same plant, `DELTA_POS_SCALE 0.20`, distance-retimed, 161
+  ticks/episode against `a5`'s 539.
+- **Does the retrain actually get faster?** (§23) `a6` exists; nothing has trained on it.
+  The diagnosis predicts ~161-tick episodes, i.e. ~16 chunks against the current ~54. If it
+  retrains slow anyway, the slowness was never the expert's and the next suspect is chunk
+  multimodality — a policy hedging toward small actions because the action distribution it
+  fits is multimodal.
+- **`--randomize-bins` has never been run against a model** (§23.1). It corrects a
+  train/eval mismatch that was silently costing 80% of the sample budget, but every number
+  in this log predates it, so no baseline is comparable across it.
+- **`--action-scale` is unmeasured.** The cheap check on the deployed `a5` checkpoint —
+  gain 2.0 on the pose channels — would confirm §23's diagnosis against the model rather
+  than only against the dataset. It costs one run and has not been done.
 - **The arm gains in `panda_libero_hand.xml` are stock, not stiffened** (§22), contrary to
   its own comment and top-level README §4.1. Untracked file in a gitignored submodule, so
   no history. Decide whether the stiffening should be restored for the `ik` path, or

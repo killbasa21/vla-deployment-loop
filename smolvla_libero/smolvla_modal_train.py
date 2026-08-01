@@ -70,8 +70,26 @@ Usage:
 
 import modal
 
-DATASET_DIR = "smolvla_libero/data/a5_smolvla"   # local, produced by convert_dataset.py
-REMOTE_REPO = "/data/greenbox/green_ball_osc"    # where it lands on the volume
+# a7, the third dataset in this sequence, and the reason for each move is worth keeping:
+#
+#   a5  scale 0.05, expert slowed 2.5x   539 ticks/ep   trained fine, served SLOW
+#   a6  scale 0.20, distance-retimed     161 ticks/ep   FAST, and misses the ball
+#   a7  scale 0.10, distance-retimed     ~256 ticks/ep  the middle setting
+#
+# a6 solved the speed problem and bought a new one: at 0.20 m per action unit, one unit of
+# normalised policy error is 40 mm on the table against a5's 15 mm, so the same policy
+# quality that grasps at a5's scale closes on air at a6's (PROGRESS.md sec.23.5). 0.10
+# halves that to ~27 mm while still running ~2.1x faster than a5.
+#
+# a7 is also 60 episodes rather than 30. The competing explanation for a6's miss is simply
+# too little data for grounding, and CPU collection is free, so this run tests both.
+#
+# NOTE the serving client must run --delta-pos-scale 0.10 to match, and --randomize-bins,
+# since a7 shuffles the bin layout every episode.
+DATASET_DIR = "smolvla_libero/data/a7_smolvla"   # local, produced by convert_dataset.py
+REMOTE_REPO = "/data/greenbox/green_ball_a7"     # its own path, like a6 got its own: an
+                                                 # overwritten volume repo leaves no way to
+                                                 # A/B the datasets against each other.
 BASE_CHECKPOINT = "HuggingFaceVLA/smolvla_libero"
 
 # Same recipe as smolvla_modal.py so the heavy pip layers are a CACHE HIT rather than a
@@ -127,7 +145,7 @@ app = modal.App("smolvla-green-ball-train")
 def train(mode: str = "lora", max_steps: int = 3000, batch_size: int = 16,
           save_freq: int = 750, lr: float = 1e-4, num_workers: int = 12,
           exp_name: str = "smolvla-green-ball", norm_stats: str = "checkpoint",
-          seed: int = 0):
+          seed: int = 0, lora_r: int = 32):
     import json
     import os
     import subprocess
@@ -161,7 +179,7 @@ def train(mode: str = "lora", max_steps: int = 3000, batch_size: int = 16,
     cmd = [
         "lerobot-train",
         f"--policy.path={BASE_CHECKPOINT}",
-        f"--dataset.repo_id=greenbox/green_ball_osc",
+        f"--dataset.repo_id=greenbox/{REMOTE_REPO.rsplit('/', 1)[-1]}",
         f"--dataset.root={REMOTE_REPO}",
         f"--output_dir={out_dir}",
         f"--job_name={exp_name}",
@@ -192,12 +210,33 @@ def train(mode: str = "lora", max_steps: int = 3000, batch_size: int = 16,
     ]
 
     if mode == "lora":
-        # LoRA on the VLM + a fully trained action expert. The measured failure is grounding
-        # (108 mm miss at an unseen ball position), which a frozen VLM cannot fix.
-        # `use_peft` is SmolVLAConfig's own switch (confirmed against the installed 0.6.0
-        # dataclass fields, alongside freeze_vision_encoder / train_expert_only).
-        cmd += ["--policy.use_peft=true",
-                "--policy.freeze_vision_encoder=false", "--policy.train_expert_only=false"]
+        # CORRECTED 2026-07-31, after a 29 s smoke failure:
+        #
+        #   ValueError: Can't find 'adapter_config.json' at 'HuggingFaceVLA/smolvla_libero'
+        #
+        # `--policy.use_peft=true` does NOT create a LoRA. In lerobot 0.6.0 it means "this
+        # checkpoint IS a PEFT adapter -- load it", so factory.make_policy goes looking for
+        # an adapter_config.json next to the base checkpoint and dies when the stock
+        # checkpoint (which is a plain policy) has none. Creating a fresh adapter is a
+        # TOP-LEVEL train field, `--peft.*`, which lerobot_train.py turns into
+        # `policy.wrap_with_peft(...)`; that call sets `config.use_peft = True` itself, on
+        # the way out, which is what makes the saved checkpoint loadable with use_peft
+        # later. Passing it on the way IN is the error.
+        #
+        # target_modules is left at SmolVLA's own default rather than specified here:
+        #   (model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj
+        #    |model\.(state_proj|action_in_proj|action_out_proj|action_time_mlp_(in|out)))
+        # i.e. the ACTION EXPERT's attention projections plus the state/action heads. That
+        # is a narrower scope than this mode's original comment claimed (it does not touch
+        # the VLM at all), and it is the right one for what a6 is fixing: episode SPEED is
+        # encoded in action magnitudes, which is the expert's job, not a grounding problem
+        # the VLM has to relearn. Revisit if the failure turns back into a localisation
+        # miss.
+        #
+        # freeze_vision_encoder / train_expert_only are NOT passed: wrap_with_peft calls
+        # requires_grad_(False) on every base parameter regardless, so they would be dead
+        # flags that read as if they were doing something.
+        cmd += [f"--peft.method_type=LORA", f"--peft.r={lora_r}"]
     elif mode == "full":
         # No adapters: train the VLM outright. 450M is small enough that this is affordable,
         # and it is the strongest option if LoRA underfits 30 episodes.
@@ -213,7 +252,7 @@ def train(mode: str = "lora", max_steps: int = 3000, batch_size: int = 16,
         # Explicit opt-in only. See the module docstring: rebuilding the normaliser from 30
         # single-task episodes hands the action expert a different affine map than the one
         # it was trained under.
-        print("WARNING: rebuilding normalisation from a5's own stats", flush=True)
+        print("WARNING: rebuilding normalisation from the dataset's own stats", flush=True)
 
     print("Launching:", " ".join(cmd), flush=True)
     t0 = time.time()
@@ -244,8 +283,9 @@ def upload():
 def main(mode: str = "lora", max_steps: int = 3000, batch_size: int = 16,
          save_freq: int = 750, lr: float = 1e-4, num_workers: int = 12,
          exp_name: str = "smolvla-green-ball", norm_stats: str = "checkpoint",
-         gpu: str = "L4", seed: int = 0):
+         gpu: str = "L4", seed: int = 0, lora_r: int = 32):
     train.with_options(gpu=gpu).remote(
         mode=mode, max_steps=max_steps, batch_size=batch_size, save_freq=save_freq,
         lr=lr, num_workers=num_workers, exp_name=exp_name, norm_stats=norm_stats, seed=seed,
+        lora_r=lora_r,
     )

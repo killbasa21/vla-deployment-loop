@@ -76,8 +76,12 @@ OLD_KEY = "observation.images.wrist_image"
 NEW_KEY = "observation.images.image2"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SRC = REPO_ROOT / "libero" / "fine_tune" / "a4"
-DEFAULT_OUT = REPO_ROOT / "smolvla_libero" / "data" / "a4_smolvla"
+# a7 by default since 2026-08-01: a4 is ik-plant; a5 is the 27 s/episode collection whose
+# slowness the first fine-tune reproduced; a6 fixed the speed and lost the grasp to a
+# 4x-coarser action unit (PROGRESS.md sec.23.5). a7 is scale 0.10, distance-retimed,
+# 60 episodes.
+DEFAULT_SRC = REPO_ROOT / "libero" / "fine_tune" / "a7"
+DEFAULT_OUT = REPO_ROOT / "smolvla_libero" / "data" / "a7_smolvla"
 
 # What smolvla_libero's config.json declares. Checked against the converted dataset at the
 # end so a future change to either side fails loudly here rather than at training time.
@@ -164,7 +168,7 @@ def install_measured_stats(meta: Path) -> str:
 
     shutil.move(stats, meta / "stats_molmoact2_released.json")
     shutil.copy(measured, stats)
-    return (f"stats.json: MolmoAct2 released (count {active_count}) -> a4 measured "
+    return (f"stats.json: MolmoAct2 released (count {active_count}) -> source measured "
             f"(count {measured_count}); old kept as stats_molmoact2_released.json")
 
 
@@ -213,7 +217,11 @@ def verify(out: Path) -> None:
     print(f"  episodes / frames : {info['total_episodes']} / {info['total_frames']}")
     print(f"  codebase_version  : {info['codebase_version']}  fps {info['fps']}")
     print(f"  features          : {', '.join(k for k in feats if k.startswith('observation') or k == 'action')}")
-    print(f"  action count      : {stats['action']['count'][0]} (a4's own)")
+    # The source dataset's OWN count. a4 is the only source where this is not automatic:
+    # pin_released_stats.py overwrote its stats.json with MolmoAct2's released LIBERO stats
+    # (count 273465), so restore_measured_stats swaps the measured file back in. a5/a6 were
+    # never pinned, so their stats.json is already their own and the swap is a no-op.
+    print(f"  action count      : {stats['action']['count'][0]} (source's own)")
     print("  action mean       :", [round(v, 3) for v in stats["action"]["mean"]])
     print("  action std        :", [round(v, 3) for v in stats["action"]["std"]])
     print("  state mean        :", [round(v, 3) for v in stats["observation.state"]["mean"]])

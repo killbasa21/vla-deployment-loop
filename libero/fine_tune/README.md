@@ -474,6 +474,138 @@ Roughly 10 s per episode attempt, single-threaded, CPU only.
 
 ---
 
+## 8.1 `a5` is slow, and so is anything trained on it (2026-07-31)
+
+The first SmolVLA fine-tune picks the ball up and places it, but takes ~54 action chunks
+to do it. That is not the policy: `a5` episodes are **539 ticks = 27 s each**, ~190 ticks
+of that before the gripper even closes, and the policy reproduces its expert faithfully.
+
+`a5` was collected with `OSC_SPEED_SCALE = 2.5`, which multiplies every segment duration.
+It exists because the label is the tracking lag over `DELTA_POS_SCALE`, and OSC realises
+only 12.3% of a commanded delta per 20 Hz tick, giving
+
+```
+v_max = DELTA_POS_SCALE * realised / dt = 0.05 * 0.123 * 20 = 0.123 m/s
+```
+
+which the ik-era timings exceed on the retreat (0.27 m/s), pinning `dx` at the ±1 bound.
+The clipping was real. The clock was the wrong knob for it — the ceiling is set by the
+action **scale**, so raising the scale raises the arm's top speed instead of lowering the
+expert's. Both `collect_finetune_data.py` and `libero_closed_loop.py` now take
+`--delta-pos-scale` (default LIBERO's 0.05, for stock-checkpoint compatibility);
+`L.FINE_TUNE_DELTA_POS_SCALE = 0.20` is the paired value, and `a6` uses it. Measured,
+4 episodes per setting, all placed:
+
+| scale | timings | ticks/ep | dx saturated | dx q01 |
+|---|---|---|---|---|
+| 0.05 (`a5`) | speed-scale 2.5 | 539 | 3.07% | −1.000 |
+| 0.125 | hand-set | 216 | 2.20% | −1.000 |
+| 0.15 | hand-set | 216 | 0.93% | −0.987 |
+| 0.15 | `--motion-speed` | 194 | 0.00% | −0.768 |
+| **0.20** | **`--motion-speed`** | **161** | **0.00%** | **−0.681** |
+| 0.25 | `--motion-speed` | 136 | 0.00% | −0.618 |
+| 0.30 | `--motion-speed` | 126 | 0.00% | −0.553 |
+
+Note the top row: the 2.5x slowdown **did not achieve its own goal**. It cost 2.5x the
+episode length and still clipped `dx` more often than any full-speed collection.
+
+0.20 is chosen for the `dx q01` column, not the tick column: −0.681 against released
+LIBERO's −0.679 is a near-exact match to the distribution the checkpoint was pretrained
+on. Past 0.25 the returns collapse (136 → 126 ticks for 20% more scale) while the label
+distribution thins and OSC torque saturation climbs.
+
+**`--motion-speed` is the third knob, and it is the one that removes the clipping
+outright.** The hand-set durations were never set against a speed budget, so the same
+trajectory both clipped and crawled — at scale 0.15 the retreat and the closing return
+run at 0.275-0.285 m/s mean against a 0.246 budget, while the descent and the transport
+run at 0.125-0.163, half of it. Retiming every motion segment to one target speed fixes
+both ends; dwells keep their hand-set durations, because they are settling and
+gripper-actuation time and their length is set by physics, not by distance. Default in osc
+mode is 0.90 x the ceiling / 1.5 (smoothstep's peak-over-mean). `--motion-speed 0` restores
+the hand-set durations.
+
+Two things follow, and both matter:
+
+- **The value is a wire convention shared by two processes.** The collector divides by it
+  to make a label; the client multiplies by it to execute one. A mismatch silently
+  rescales every motion the policy asks for, with no error. Pass the same value to both.
+  It is recorded per-chunk in the run log under `timing.delta_pos_scale`.
+- **The noise sigmas move with it.** They are in action units, so the physical disturbance
+  per unit is proportional to the scale; `--noise-sigma-pos` is auto-scaled by
+  `0.05 / --delta-pos-scale` (0.47 → 0.157 at 0.15) unless given explicitly. Leaving it
+  at the `a5` value would triple the calibrated kick (§4.3) and stop episodes succeeding.
+
+### 8.2 The bins are randomised in training and fixed at inference
+
+Separate issue, found alongside the above, and it costs sample efficiency rather than
+speed. `bin_layout()` permutes green/blue/yellow across three slots with ±2 cm of jitter
+every episode. `libero_closed_loop.py` randomises nothing about the bins — it has
+`--randomize-ball` and no bin equivalent — so every evaluation runs the scene XML's own
+layout, green at **(0.56, 0.25)**. In `a5` that layout drew **6 of 30 episodes**; the
+remaining 24 demonstrate reaching toward bins that are not present at inference, and the
+colour-grounding skill they buy is never tested.
+
+Two coherent resolutions, and the mismatch is the only indefensible option:
+
+- **Randomise both** (chosen for `a6`). `libero_closed_loop.py --randomize-bins` shuffles
+  the bins at reset exactly as the collector does, drawing from `BIN_SLOTS` **imported
+  from** `libero_closed_loop.py` rather than a second copy of the list — two copies is how
+  the two sides end up sampling different distributions with nothing erroring. Keeps the
+  colour-grounding skill and actually tests it.
+- **Pin both.** `--bin-layout scene` pins the bins to the scene XML's positions and the
+  client stays as it was. Buys ~5x the density on the one configuration under test, at the
+  cost of a policy that has memorised where green is. Reasonable at 30-50 episodes if a
+  working demo is the goal rather than colour grounding.
+
+Note this is orthogonal to the ball, which is randomised on both sides already
+(`BALL_SAMPLE_X/Y`, and `--randomize-ball` at inference), so the grasp stays a real
+closed-loop problem either way.
+
+### 8.3 The speed/precision frontier — why `a6` is fast and misses (2026-08-01)
+
+`a6` served at ~20 chunks per episode against `a5`'s ~54, with the phases in the right
+order. It also **never moved the ball** in three runs: it closes on air, 36 mm laterally
+off at the nominal ball position (11 mm but 40 mm high at checkpoint 3000).
+
+That is a direct cost of raising `DELTA_POS_SCALE`. Under MEAN_STD normalisation the
+metres one unit of *normalised* policy error carries is `std(dx) * DELTA_POS_SCALE`:
+
+| dataset | scale | ticks/ep | dx std | mm per 1.0 normalised error |
+|---|---|---|---|---|
+| `a5` (slow, **grasps**) | 0.05 | 539 | 0.309 | **15.5** |
+| `a6` (fast, **misses**) | 0.20 | 160 | 0.200 | **40.0** |
+| `a7` | 0.10 | ~256 | ~0.27 | ~27 |
+
+`a6`'s 36 mm miss is ~0.9 normalised units; the same 0.9 at `a5`'s resolution is 14 mm,
+inside the ball's 20 mm radius. **The `a5`-grasps/`a6`-misses split is the units, not the
+policy** — and no amount of extra training recovers a 2.6x change in what an action means.
+
+So `DELTA_POS_SCALE` trades speed against terminal precision along a frontier the plant
+sets (12.3% realised per tick), and 0.20 is past the knee. Pick it by what the task
+needs at the *end* of a reach, not by episode length: a 40 mm grasp tolerance is the
+budget here, and the scale has to leave the policy's own error inside it.
+
+Regenerate and retrain:
+
+```bash
+# a6, as collected: 30 episodes, shuffled bins, scale 0.20, distance-retimed
+MUJOCO_GL=egl uv run python libero/fine_tune/collect_finetune_data.py \
+    --out libero/fine_tune/a6 --delta-pos-scale 0.20 --bin-layout shuffle \
+    --reach 10 --noise 10 --recover 10 --seed 0 --max-attempts-per-episode 12
+uv run python smolvla_libero/convert_dataset.py --src libero/fine_tune/a6 \
+    --out smolvla_libero/data/a6_smolvla
+# then serve, and run the client at the SAME scale, with bins randomised to match:
+uv run python libero/libero_closed_loop.py --delta-pos-scale 0.20 --randomize-bins \
+    --randomize-ball --server-url <url>/act
+```
+
+Before spending that: `libero_closed_loop.py --action-scale 2.0` puts a gain on the
+policy's pose channels at inference, clipped back to ±1. It is off-distribution and not a
+fix, but if the existing `a5` checkpoint visibly speeds up under it, the diagnosis above
+is confirmed against the deployed model rather than only against the dataset.
+
+---
+
 ## 9. Known limitations
 
 - **Untested against a training run.** The format is validated structurally against the

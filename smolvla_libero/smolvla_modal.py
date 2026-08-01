@@ -50,10 +50,33 @@ return 10 actions per call instead: it matches LIBERO's own action horizon, matc
 `libero_closed_loop.py` expects (it warns on anything else), and matches the
 `--policy.n_action_steps=10` LeRobot itself uses to reproduce published LIBERO results.
 
+SERVING A FINE-TUNE
+-------------------
+`SMOLVLA_CHECKPOINT` may point at a directory on the `molmoact2-checkpoints` volume instead
+of the HuggingFace repo. If that directory contains an `adapter_config.json` it is a LoRA
+adapter, not a whole policy, and `load()` takes PEFT's path: base policy from the adapter's
+`base_model_name_or_path`, adapter applied, then merged. Nothing about the wire protocol
+changes.
+
+TWO CONVENTIONS MUST MATCH THE DATASET THE CHECKPOINT WAS TRAINED ON, and neither is
+carried in the checkpoint, so neither can be checked here:
+  * `--delta-pos-scale` -- a6 is 0.20, not LIBERO's 0.05. The client multiplies by it to
+    execute an action; the collector divided by it to make the label. A mismatch rescales
+    every motion the policy asks for, silently.
+  * `--randomize-bins` -- a6 shuffles the bin layout every episode. Evaluating on the fixed
+    scene layout measures one draw of three (PROGRESS.md sec.23.1).
+
 Usage:
     modal run smolvla_libero/smolvla_modal.py            # ephemeral, runs a self-test
     modal serve smolvla_libero/smolvla_modal.py          # dev server, live reload
     modal deploy smolvla_libero/smolvla_modal.py         # persistent, prints a stable URL
+
+    # the a6 fine-tune:
+    SMOLVLA_CHECKPOINT=/checkpoints/smolvla/smolvla-a6-lora/checkpoints/005000/pretrained_model \
+        modal deploy smolvla_libero/smolvla_modal.py
+    uv run python libero/libero_closed_loop.py --payload-keys libero \
+        --delta-pos-scale 0.20 --randomize-bins --randomize-ball \
+        --chunks 20 --no-view --server-url https://<...>.modal.run/act
 """
 
 import os
@@ -101,7 +124,12 @@ image = (
     # `[smolvla]` pulls the SmolVLM2 vision/language deps. Deliberately NOT `[libero]`: that
     # extra drags in robosuite -> egl_probe, which needs cmake and an OpenGL toolchain and
     # exists only to run the LIBERO *simulator*. Our simulator is local MuJoCo.
-    .pip_install("lerobot[smolvla]", "fastapi[standard]", "json-numpy", "pillow")
+    # `peft` is needed only when SMOLVLA_CHECKPOINT points at one of our LoRA fine-tunes,
+    # but it is installed unconditionally: no lerobot extra pulls it (smolvla_modal_train.py
+    # found the same thing the hard way), and making it conditional on the env var would
+    # mean the stock and fine-tuned deployments build different images for no benefit --
+    # peft is a few hundred KB of Python.
+    .pip_install("lerobot[smolvla]", "peft", "fastapi[standard]", "json-numpy", "pillow")
     # Bake the selected checkpoint into the image so the container reads the same value the
     # deploy was made with, rather than whatever the environment happens to hold at runtime.
     .env({"SMOLVLA_CHECKPOINT": CHECKPOINT})
@@ -149,7 +177,39 @@ class SmolVLAServer:
         # cost of fp32 is ~1.8 GB, which is irrelevant on a 16 GB card.
         self.dtype = torch.float32
 
-        self.policy = SmolVLAPolicy.from_pretrained(CHECKPOINT)
+        # A fine-tune from smolvla_modal_train.py is a LoRA ADAPTER, not a whole policy: the
+        # directory holds an adapter_config.json and ~9 MB of adapter_model.safetensors, and
+        # SmolVLAPolicy.from_pretrained cannot read it (no config weights to load). Detect
+        # that case and take PEFT's own path -- base policy first, adapter on top.
+        #
+        # Note the symmetry with the training bug in PROGRESS.md sec.23.3: `use_peft=true`
+        # was WRONG there (the stock checkpoint has no adapter to load) and is RIGHT here,
+        # because this checkpoint does. Same flag, opposite correctness, decided entirely by
+        # whether adapter_config.json exists -- so this branches on the file, not on a flag
+        # anyone has to remember to set.
+        adapter_cfg = os.path.join(CHECKPOINT, "adapter_config.json")
+        if os.path.exists(adapter_cfg):
+            from peft import PeftConfig, PeftModel
+
+            peft_config = PeftConfig.from_pretrained(CHECKPOINT)
+            base = peft_config.base_model_name_or_path
+            if not base:
+                raise RuntimeError(
+                    f"{adapter_cfg} has no base_model_name_or_path, so there is nothing to "
+                    "apply the adapter to."
+                )
+            print(f"PEFT adapter detected; base = {base}", flush=True)
+            self.policy = SmolVLAPolicy.from_pretrained(base)
+            self.policy = PeftModel.from_pretrained(self.policy, CHECKPOINT)
+            # Fold the adapter into the base weights and hand back a plain SmolVLAPolicy.
+            # Serving a PeftModel wrapper would work -- it forwards attribute access -- but
+            # every downstream line here (policy.config, predict_action_chunk, reset) would
+            # be going through __getattr__ on a wrapper whose behaviour is not part of this
+            # file's contract. Merging is exact for LoRA and removes the question.
+            self.policy = self.policy.merge_and_unload()
+            print("adapter merged into base weights", flush=True)
+        else:
+            self.policy = SmolVLAPolicy.from_pretrained(CHECKPOINT)
         self.policy.to(device=self.device, dtype=self.dtype)
         self.policy.eval()
         self.policy.reset()

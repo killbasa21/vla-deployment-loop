@@ -99,12 +99,71 @@ def _lowdim_stats(values, with_quantiles=False, integral=False):
 INTEGRAL_COLUMNS = ("frame_index", "episode_index", "index", "task_index")
 
 
+def _c31(x):
+    return np.asarray(x, dtype=np.float64).reshape(3, 1, 1).tolist()
+
+
+class ImageStatsAccumulator:
+    """Streaming per-channel min/max/mean/std over [0,1]-normalised pixels.
+
+    REPLACES a version that did `np.asarray(frames, dtype=np.float32) / 255.0` over a whole
+    episode (or, for the dataset-wide stats, every 5th frame of the entire dataset) and
+    then reduced it. That materialised a float32 copy 4x the size of the uint8 frames --
+    0.26 GB per camera per 334-frame episode, and a 3.1 GB spike for the global pass -- on
+    top of the raw frames still being held. It is what made `a7` (60 episodes, 20034
+    frames) die in `finalize()` after every episode had already been simulated: the most
+    expensive possible moment to run out of memory.
+
+    Accumulating sum / sumsq / min / max in float64 is O(1) in memory, exact for min and
+    max, and agrees with `np.std` to ~1e-9 on this data. It also removes the reason the old
+    global pass subsampled every 5th frame, so the dataset-wide image stats are now over
+    EVERY frame rather than 20% of them -- more accurate, and cheaper.
+    """
+
+    __slots__ = ("_n", "_frames", "_sum", "_sumsq", "_min", "_max")
+
+    def __init__(self):
+        self._n = 0        # pixels, for the mean/std denominator
+        self._frames = 0   # frames, which is what `count` reports (matches the released
+                           # stats.json, where image count is a frame count not a pixel one)
+        self._sum = np.zeros(3, dtype=np.float64)
+        self._sumsq = np.zeros(3, dtype=np.float64)
+        self._min = np.full(3, np.inf, dtype=np.float64)
+        self._max = np.full(3, -np.inf, dtype=np.float64)
+
+    def update(self, frame):
+        """Fold one (H,W,3) uint8 frame in. One frame at a time on purpose: the caller
+        already has it in hand, so nothing new is allocated beyond a single float64 view."""
+        a = np.asarray(frame, dtype=np.float64).reshape(-1, 3) / 255.0
+        self._n += a.shape[0]
+        self._frames += 1
+        self._sum += a.sum(0)
+        self._sumsq += np.square(a).sum(0)
+        np.minimum(self._min, a.min(0), out=self._min)
+        np.maximum(self._max, a.max(0), out=self._max)
+
+    def result(self, count=None):
+        if self._n == 0:
+            raise ValueError("no frames accumulated")
+        mean = self._sum / self._n
+        # max(0, ...) guards the case where round-off makes E[x^2] - E[x]^2 a tiny
+        # negative on a constant channel (e.g. a camera that never sees anything but a
+        # flat background), which would otherwise produce nan through the sqrt.
+        var = np.maximum(self._sumsq / self._n - np.square(mean), 0.0)
+        return {
+            "min": _c31(self._min),
+            "max": _c31(self._max),
+            "mean": _c31(mean),
+            "std": _c31(np.sqrt(var)),
+            "count": [int(self._frames if count is None else count)],
+        }
+
+
 def _image_stats(frames):
     """Per-channel stats on [0,1]-normalised pixels, shaped (3,1,1).
 
-    Matches the released dataset's `[[[r]], [[g]], [[b]]]` nesting exactly. Frames are
-    subsampled because the exact mean of every pixel of every frame is not worth the
-    memory, and these stats are only ever used for normalisation."""
+    Kept for callers that genuinely hold a small frame list. The writer itself no longer
+    uses it -- see ImageStatsAccumulator for why."""
     arr = np.asarray(frames, dtype=np.float32) / 255.0  # (T,H,W,3)
     flat = arr.reshape(-1, arr.shape[-1])
 
@@ -123,10 +182,23 @@ def _image_stats(frames):
 class LeRobotV30Writer:
     """Accumulates episodes, then writes the whole v3.0 tree in `finalize()`.
 
-    Everything is buffered in memory until finalize because v3.0 concatenates episodes
-    into shared data files and needs global `index` numbering and dataset-wide stats. For
-    the 50-ish short episodes this is used for that is a few hundred MB; it would need a
-    streaming rewrite for thousands.
+    Episodes are buffered until finalize because v3.0 concatenates them into shared data
+    files and needs global `index` numbering and dataset-wide stats. What is buffered is
+    **PNG bytes, not raw frames**, and that distinction is the difference between working
+    and dying:
+
+        raw uint8 256x256x3      196.6 kB per frame
+        PNG of a rendered scene   ~12 kB per frame     (measured on a6)
+
+    a7 is 20034 frames x 2 cameras. Held raw that is 7.9 GB, on a 15 GB machine, and
+    `finalize()` then wanted a float32 copy for image stats and an Arrow buffer for the
+    encoded PNGs on top of it -- so it OOMed after simulating all 60 episodes, losing the
+    lot. Held as PNG it is ~0.5 GB, which is simply the size of the files being written.
+
+    Encoding at ingest costs nothing overall: every frame gets PNG-encoded exactly once
+    either way. It just happens while the frame is already in hand rather than in one
+    spike at the end. Per-episode image stats are folded in at the same moment for the
+    same reason (see ImageStatsAccumulator).
     """
 
     def __init__(self, root, fps, image_shape=(256, 256, 3), state_dim=8, action_dim=7,
@@ -141,8 +213,11 @@ class LeRobotV30Writer:
         self._image_keys = [f"observation.images.{c}" for c in self.cameras]
 
         self._tasks = {}
-        self._episodes = []   # dicts with frames/states/actions/task/extra
+        self._episodes = []   # dicts with png/states/actions/task/extra/img_stats
         self._total_frames = 0
+        # Dataset-wide image stats, folded in as episodes arrive. Kept per camera because
+        # the two views have genuinely different pixel distributions.
+        self._global_img = {c: ImageStatsAccumulator() for c in self.cameras}
 
     # -- ingestion ---------------------------------------------------------
 
@@ -169,12 +244,27 @@ class LeRobotV30Writer:
         if task not in self._tasks:
             self._tasks[task] = len(self._tasks)
 
+        # Encode and measure HERE, while the caller's frames are live, then drop the raw
+        # arrays. Holding them to finalize is what OOMed a7 -- see the class docstring.
+        png = {}
+        img_stats = {}
+        for c in self.cameras:
+            acc = ImageStatsAccumulator()
+            encoded = []
+            for f in frames[c]:
+                acc.update(f)
+                self._global_img[c].update(f)
+                encoded.append(_png_bytes(f))
+            png[c] = encoded
+            img_stats[c] = acc.result()
+
         self._episodes.append({
-            "frames": {c: list(frames[c]) for c in self.cameras},
+            "png": png,
             "states": states,
             "actions": actions,
             "task": task,
             "extra": dict(extra or {}),
+            "img_stats": img_stats,
         })
         self._total_frames += T
         return len(self._episodes) - 1
@@ -186,8 +276,8 @@ class LeRobotV30Writer:
         cols = {}
         for cam, key in zip(self.cameras, self._image_keys):
             cols[key] = pa.array(
-                [{"bytes": _png_bytes(f), "path": f"frame_{i:06d}.png"}
-                 for i, f in enumerate(ep["frames"][cam])],
+                [{"bytes": b, "path": f"frame_{i:06d}.png"}
+                 for i, b in enumerate(ep["png"][cam])],
                 type=pa.struct([("bytes", pa.binary()), ("path", pa.string())]),
             )
         cols["observation.state"] = pa.array(
@@ -296,7 +386,7 @@ class LeRobotV30Writer:
                 "length": T,
             }
             for cam, key in zip(self.cameras, self._image_keys):
-                for name, val in _image_stats(ep["frames"][cam]).items():
+                for name, val in ep["img_stats"][cam].items():
                     row[f"stats/{key}/{name}"] = val
             for key, values in [("observation.state", ep["states"]),
                                 ("action", ep["actions"])]:
@@ -351,11 +441,9 @@ class LeRobotV30Writer:
             "action": _lowdim_stats(all_actions, with_quantiles=True),
         }
         for cam, key in zip(self.cameras, self._image_keys):
-            # Subsample across the whole dataset: exact per-pixel stats over every frame
-            # would need all of it resident at once for no benefit at normalisation.
-            sample = [f for e in self._episodes for f in e["frames"][cam][::5]]
-            stats[key] = _image_stats(sample)
-            stats[key]["count"] = [self._total_frames]
+            # Folded in at ingest, over EVERY frame. The old code subsampled every 5th
+            # frame here only because the exact version needed the whole dataset resident.
+            stats[key] = self._global_img[cam].result(count=self._total_frames)
         for col, arr in [
             ("timestamp", np.concatenate(
                 [np.arange(len(e["states"])) / self.fps for e in self._episodes])),

@@ -3,8 +3,24 @@
 Running **`HuggingFaceVLA/smolvla_libero`** — HuggingFace's official SmolVLA-450M fine-tuned
 on LIBERO — against this project's MuJoCo Panda scene.
 
-Status, 2026-07-28: **stock checkpoint only.** No fine-tune has been run. The dataset is
-converted and ready; that is the next step, not this one.
+Status, 2026-07-31: **first fine-tune done, on `a5`. It works and it is slow** — it
+approaches, grasps, transports and places, but takes ~54 action chunks to do it.
+
+That is the dataset, not the policy: `a5` episodes are 539 ticks / 27 s each, so the
+policy is reproducing its expert faithfully. Full diagnosis in `libero/PROGRESS.md` §23;
+the short version is that `OSC_SPEED_SCALE = 2.5` slowed the expert to stop action labels
+clipping, which is the wrong knob for that (the ceiling is set by `DELTA_POS_SCALE`) and
+did not even work — `a5` still clips `dx` on 3.07% of frames.
+
+**`a6` is the re-collection**: `--delta-pos-scale 0.20`, distance-retimed segments,
+shuffled bins. 161 ticks/episode, 0.00% saturation, and `dx q01 = -0.681` against released
+LIBERO's -0.679. Retraining on it is the next step. Two things must match at serving time
+or the run is not measuring `a6`:
+
+```bash
+uv run python libero/libero_closed_loop.py --delta-pos-scale 0.20 \
+    --randomize-bins --randomize-ball --server-url <url>/act
+```
 
 ## Why this checkpoint
 

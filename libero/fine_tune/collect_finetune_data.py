@@ -96,9 +96,12 @@ BALL_REST_Z = L.TABLE_TOP_Z + BALL_RADIUS
 # Bin anchor slots, read off scene_libero_hand.xml. Which colour sits at which slot is
 # shuffled per episode so the model has to LOOK for the green one rather than memorise a
 # fixed coordinate -- the same argument phase4_collect_demos.py makes.
-BIN_SLOTS = [(0.56, 0.25), (0.56, -0.25), (0.80, 0.0)]
-BIN_SLOT_JITTER = 0.02
-BIN_NAMES = ("green_bin", "blue_bin", "yellow_bin")
+# Imported, not redeclared: libero_closed_loop.py --randomize-bins draws from the same
+# three slots, and two copies of this list is how the collector and the evaluation end up
+# sampling different distributions without anything erroring.
+BIN_SLOTS = L.BIN_SLOTS
+BIN_SLOT_JITTER = L.BIN_SLOT_JITTER
+BIN_NAMES = L.BIN_NAMES
 
 # Noise cohort. Sigma is in ACTION units, so 0.15 is 7.5 mm of translation per tick
 # (0.15 * DELTA_POS_SCALE) and 0.04 is 0.02 rad of rotation. Sized to knock the arm
@@ -155,6 +158,26 @@ OSC_SPEED_SCALE = 2.5
 OSC_NOISE_SIGMA_POS = 0.47
 OSC_NOISE_SIGMA_ROT = 0.125   # holds the ik plant's 0.267 rot/pos ratio
 
+# --- Distance retiming (--motion-speed) ---------------------------------------------
+# A waypoint whose target is within this of the previous one is a DWELL, and keeps its
+# hand-set duration: it is there to let the plant settle or the gripper actuate, so its
+# length is set by physics, not by how far the arm has to travel. 1 mm is well under the
+# smallest real motion (the 30 mm backoff lift).
+DWELL_DIST = 1e-3
+# Floor on a retimed motion segment. Below ~5 ticks at 20 Hz the smoothstep no longer has
+# room to accelerate and decelerate, and the reference is effectively a step.
+MIN_MOTION_SECS = 0.25
+# Fraction of the label ceiling the default target speed aims at. Smoothstep PEAKS at 1.5x
+# its mean, so the mean budget is v_max/1.5, and the arm needs headroom above the nominal
+# geometry this was computed on -- a ball at the near edge of BALL_SAMPLE_X and a bin at
+# the far slot is a longer transport than the nominal 0.252 m.
+MOTION_SPEED_HEADROOM = 0.90
+# The plant constant everything above keys off: OSC realises this fraction of a commanded
+# per-tick displacement (verify_osc.py; 12.3% is the analytic step response of a critically
+# damped wn = sqrt(150) system at 50 ms, to within 0.3 points).
+OSC_REALISED_FRACTION = 0.123
+SMOOTHSTEP_PEAK = 1.5   # a smoothstep segment's peak velocity over its mean
+
 # Recovery cohort.
 #
 # a1's version was ONE kick of 0.85 placed in the first 45% of the episode, and it was too
@@ -209,8 +232,33 @@ RETREAT_BACKOFF_LIFT = 0.03   # m, and slightly up, so the withdrawal is not a t
 RETREAT_BACKOFF_SECS = 0.45   # each way
 
 
-def bin_layout(model, bin_ids, rng):
-    """Shuffle the three bins across the three slots and return green's (x, y)."""
+def bin_layout(model, bin_ids, rng, mode="shuffle", scene_xy=None):
+    """Place the three bins for one episode and return green's (x, y).
+
+    Two modes, and the choice is about what the fine-tune is FOR:
+
+    "shuffle" (a1-a5) permutes the three bins across the three slots with +-2 cm of
+    jitter, so the policy has to resolve "green" by colour rather than by memorised
+    position. That is the general skill -- but the closed loop NEVER randomises bins
+    (libero_closed_loop.py has --randomize-ball and no bin equivalent), so every
+    evaluation runs the one layout the scene XML declares, green at (0.56, 0.25). In a5
+    that layout drew only 6 of 30 episodes; the other 24 taught reaching toward bins that
+    are not there at inference.
+
+    "scene" pins the bins to the scene's own positions, i.e. exactly what will be
+    evaluated, and keeps the jitter off. At 30-50 episodes this is usually the better
+    trade: 5x the density on the configuration under test, at the cost of a policy that
+    has memorised where green is instead of learning to look. Use "shuffle" if the point
+    is colour grounding, "scene" if the point is a working demo.
+
+    `scene_xy` is the model's ORIGINAL green-bin (x, y), captured before any episode
+    moved it -- see main(). Reading it live would return the last episode's placement.
+    """
+    if mode == "scene":
+        for name, (x, y) in zip(BIN_NAMES, scene_xy):
+            model.body_pos[bin_ids[name]] = [x, y, L.TABLE_TOP_Z]
+        return tuple(scene_xy[BIN_NAMES.index("green_bin")])
+
     order = rng.permutation(len(BIN_SLOTS))
     green_xy = None
     for name, slot_idx in zip(BIN_NAMES, order):
@@ -327,7 +375,8 @@ def waypoints(ball_xy, bin_xy, start_pos):
     ]
 
 
-def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_scale=1.0):
+def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_scale=1.0,
+                    motion_speed=None):
     """Expand the waypoints into one (target_pos, gripper) per control tick.
 
     `speed_scale` multiplies every segment DURATION, so >1 makes the reference slower. It
@@ -364,6 +413,20 @@ def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_sca
     prev_pos = data.site_xpos[site_id].copy()
     prev_grip = OPEN
     for target, grip, dur in waypoints(ball_xy, bin_xy, prev_pos):
+        dist = float(np.linalg.norm(np.asarray(target, dtype=float) - prev_pos))
+        if motion_speed is not None and dist > DWELL_DIST:
+            # Retime by DISTANCE instead of using the hand-set duration. The hand-set
+            # timings are uneven against the ceiling -- measured on the nominal geometry,
+            # the retreat and the closing return run at 0.275-0.285 m/s mean while the
+            # descent and the transport crawl at 0.125-0.163, so the same trajectory both
+            # clips labels AND wastes ticks. One target speed fixes both ends: the fast
+            # segments slow just enough to stop clipping, the slow ones speed up.
+            #
+            # The floor is not cosmetic. A short segment retimed to a couple of ticks is a
+            # near-step in the reference, which is the velocity discontinuity smoothstep
+            # exists to avoid (below) -- and that discontinuity is what shook the ball out
+            # of the grasp in the early calibration runs.
+            dur = max(MIN_MOTION_SECS, dist / motion_speed)
         n = max(1, int(round(dur * speed_scale / dt)))
         for k in range(1, n + 1):
             a = k / n
@@ -395,7 +458,7 @@ def expert_action(data, site_id, target_pos, target_mat, grip):
 
 def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_body,
                 rng, cohort, control_hz, decimation, ball_xy, bin_xy, osc=None,
-                speed_scale=1.0):
+                speed_scale=1.0, motion_speed=None):
     """Execute one demonstration. Returns (frames, states, actions, info)."""
     arm_jitter = RECOVER_START_JITTER if cohort == "recover" else 0.0
     reset_episode(model, data, rng, ball_xy, arm_jitter=arm_jitter, osc=osc)
@@ -406,7 +469,7 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
     target_mat = data.site_xmat[site_id].copy()
 
     track = reference_track(model, data, site_id, ball_xy, bin_xy, control_hz,
-                            speed_scale=speed_scale)
+                            speed_scale=speed_scale, motion_speed=motion_speed)
 
     # Recovery cohort: two shoves, one free-armed during the approach and one loaded
     # during the transport. See RECOVER_KICK_WINDOWS.
@@ -604,6 +667,47 @@ def main():
     )
     p.add_argument("--noise-sigma-rot", type=float, default=None,
                    help=f"rotation counterpart of --noise-sigma-pos (default {NOISE_SIGMA_ROT})")
+    p.add_argument(
+        "--delta-pos-scale", type=float, default=L.DELTA_POS_SCALE,
+        help=(
+            "metres per unit action -- the OTHER end of the same constraint --speed-scale "
+            "addresses, and usually the better one. The label ceiling is "
+            "v <= DELTA_POS_SCALE * realised / dt, so raising the scale raises the arm's "
+            "top speed instead of lowering the expert's. a5 took the --speed-scale route "
+            "and produced 27 s / 539-tick episodes that STILL clip dx on 3.07% of frames; "
+            f"--delta-pos-scale {L.FINE_TUNE_DELTA_POS_SCALE} clips 0.93% at the original "
+            "10.8 s. SmolVLA normalises actions MEAN_STD from the "
+            "dataset's own stats, so the unit itself is invisible to training. THE SERVING "
+            "CLIENT MUST PASS THE SAME VALUE (libero_closed_loop.py --delta-pos-scale); "
+            f"default {L.DELTA_POS_SCALE} is LIBERO's own, for stock-checkpoint compatibility"
+        ),
+    )
+    p.add_argument(
+        "--motion-speed", type=float, default=None, metavar="M_PER_S",
+        help=(
+            "retime every MOTION segment of the reference to this mean speed, instead of "
+            "using its hand-set duration. Dwells (targets under 1 mm apart) keep theirs -- "
+            "they are settling and gripper-actuation time, set by physics not distance. "
+            "The hand-set timings are uneven against the label ceiling: on the nominal "
+            "geometry the retreat and closing return run at 0.275-0.285 m/s while the "
+            "descent and transport crawl at 0.125-0.163, so one target speed both stops "
+            "the clipping and reclaims the wasted ticks. Pass 'auto' semantics by omitting "
+            f"it in osc mode, which uses {MOTION_SPEED_HEADROOM:g} x the ceiling "
+            "(DELTA_POS_SCALE * 0.123 * control_hz / 1.5, the 1.5 being smoothstep's "
+            "peak-over-mean). 0 disables retiming and restores the hand-set durations"
+        ),
+    )
+    p.add_argument(
+        "--bin-layout", choices=("shuffle", "scene"), default="shuffle",
+        help=(
+            "where the three bins go each episode. 'shuffle' (default, what a1-a5 used) "
+            "permutes them across three slots with jitter, so green has to be found by "
+            "colour. 'scene' pins them to the scene XML's own positions -- which is the "
+            "ONLY layout libero_closed_loop.py ever evaluates, since it has no bin "
+            "randomisation. In a5 the evaluated layout drew 6 of 30 episodes. See "
+            "bin_layout's docstring for the trade"
+        ),
+    )
     p.add_argument("--verbose", action="store_true",
                    help="print why each rejected attempt was rejected")
     p.add_argument("--selftest", action="store_true")
@@ -616,12 +720,35 @@ def main():
     # bare module constants: an ik-calibrated sigma under OSC delivers ~1/6 the physical
     # disturbance, so the noise cohort silently degenerates into a second reach cohort --
     # near-100% first-attempt keeps, which reads as success while teaching nothing.
+    L.set_delta_pos_scale(args.delta_pos_scale)
+
+    # The two knobs solve the same clipping problem, so the speed default has to know
+    # which one is already doing the work. OSC_SPEED_SCALE was measured at LIBERO's
+    # 0.05 m/unit; the ceiling is linear in the scale, so a larger scale needs
+    # proportionally less slowdown, and at 0.125 it needs none.
     if args.speed_scale is None:
-        args.speed_scale = OSC_SPEED_SCALE if args.control_mode == "osc" else 1.0
+        if args.control_mode != "osc":
+            args.speed_scale = 1.0
+        else:
+            args.speed_scale = max(
+                1.0, OSC_SPEED_SCALE * L.DELTA_POS_SCALE_LIBERO / args.delta_pos_scale)
+    # Same coupling for the sigmas, and for the same reason: they are in ACTION units, so
+    # the physical disturbance one unit delivers is proportional to the scale. 0.47 at
+    # 0.05 m/unit is 0.188 at 0.125, and leaving it at 0.47 would triple the kick the
+    # sweep was calibrated to (README sec.4.3) and simply stop episodes succeeding.
+    # Same ceiling that sets --speed-scale, expressed as a speed rather than a multiplier.
+    # OSC only: the ik plant realises 72% per tick and was never the binding case.
+    if args.motion_speed is None and args.control_mode == "osc":
+        args.motion_speed = (MOTION_SPEED_HEADROOM * args.delta_pos_scale
+                             * OSC_REALISED_FRACTION * args.control_hz / SMOOTHSTEP_PEAK)
+    if args.motion_speed is not None and args.motion_speed <= 0:
+        args.motion_speed = None   # explicit 0 = keep the hand-set durations
+
+    sigma_gain = L.DELTA_POS_SCALE_LIBERO / args.delta_pos_scale
     if args.noise_sigma_pos is None and args.control_mode == "osc":
-        args.noise_sigma_pos = OSC_NOISE_SIGMA_POS
+        args.noise_sigma_pos = OSC_NOISE_SIGMA_POS * sigma_gain
     if args.noise_sigma_rot is None and args.control_mode == "osc":
-        args.noise_sigma_rot = OSC_NOISE_SIGMA_ROT
+        args.noise_sigma_rot = OSC_NOISE_SIGMA_ROT * sigma_gain
 
     if args.noise_sigma_pos is not None:
         NOISE_SIGMA_POS = args.noise_sigma_pos
@@ -657,6 +784,8 @@ def main():
     finger_qposadr = _finger_adr(model)
     ball_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "green_ball")
     bin_ids = {n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) for n in BIN_NAMES}
+    # Captured BEFORE any episode moves them; --bin-layout scene restores these.
+    scene_bin_xy = [model.body_pos[bin_ids[n]][:2].copy() for n in BIN_NAMES]
 
     osc = L.OSCController(model, site_id) if args.control_mode == "osc" else None
 
@@ -685,6 +814,14 @@ def main():
           else f"table floor : eef target clamped to {L.EEF_MIN_Z:+.4f} "
                f"({args.min_clearance * 1000:.0f} mm above the top)")
     print(f"noise sigma : pos {NOISE_SIGMA_POS}  rot {NOISE_SIGMA_ROT}")
+    print("motion speed: " + ("hand-set segment durations" if args.motion_speed is None
+                              else f"{args.motion_speed:.3f} m/s mean, retimed by distance "
+                                   f"(peak {args.motion_speed * SMOOTHSTEP_PEAK:.3f} vs "
+                                   f"ceiling {args.delta_pos_scale * OSC_REALISED_FRACTION * args.control_hz:.3f})"))
+    print(f"bin layout  : {args.bin_layout}" + (
+        f"  (green pinned at {np.round(scene_bin_xy[BIN_NAMES.index('green_bin')], 3)}, "
+        "the layout the closed loop evaluates)" if args.bin_layout == "scene" else
+        "  (3 slots permuted; the closed loop needs --randomize-bins to match)"))
     print(f"out         : {args.out}\n")
 
     plan = ([("reach", i) for i in range(args.reach)]
@@ -702,11 +839,12 @@ def main():
         kept = None
         for attempt in range(args.max_attempts_per_episode):
             ball_xy = (rng.uniform(*L.BALL_SAMPLE_X), rng.uniform(*L.BALL_SAMPLE_Y))
-            bin_xy = bin_layout(model, bin_ids, rng)
+            bin_xy = bin_layout(model, bin_ids, rng, mode=args.bin_layout,
+                                scene_xy=scene_bin_xy)
             frames, states, actions, info = run_episode(
                 model, data, scratch, renderer, site_id, finger_qposadr, ball_body,
                 rng, cohort, args.control_hz, decimation, ball_xy, bin_xy, osc=osc,
-                speed_scale=args.speed_scale)
+                speed_scale=args.speed_scale, motion_speed=args.motion_speed)
             if info["lifted"] and (info["placed"] or args.keep_unplaced):
                 kept = (frames, states, actions, info, attempt + 1)
                 break
