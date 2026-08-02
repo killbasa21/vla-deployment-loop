@@ -200,13 +200,23 @@ def score_log(path, bin_xy):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("logs", nargs="+")
+    p.add_argument("logs", nargs="+",
+                   help="log files, or any directory below assets/ -- a directory is "
+                        "searched recursively for *.jsonl, so a whole policy "
+                        "(assets/act/act-green-ball_010000) scores in one command")
     p.add_argument("--model-path", default=L.DEFAULT_MODEL_PATH)
     p.add_argument("--json", action="store_true", help="dump the per-run dicts as JSON")
     args = p.parse_args()
 
+    paths = []
+    for entry in args.logs:
+        path = Path(entry)
+        paths.extend(sorted(path.rglob("*.jsonl")) if path.is_dir() else [path])
+    if not paths:
+        raise SystemExit("no .jsonl logs found in: " + " ".join(args.logs))
+
     bin_xy = green_bin_xy(args.model_path)
-    results = [r for r in (score_log(f, bin_xy) for f in args.logs) if r]
+    results = [r for r in (score_log(f, bin_xy) for f in paths) if r]
     if not results:
         raise SystemExit("nothing to score")
 

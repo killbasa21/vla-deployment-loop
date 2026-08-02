@@ -81,7 +81,15 @@ Usage:
 
 import os
 
+import sys
+from pathlib import Path
+
 import modal
+
+# The shared image definitions live at the repo root, and Modal re-imports this
+# module inside the container -- where infra/ lands on /root via with_infra().
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.modal_images import lerobot_serve_image, with_infra
 
 # Which weights to serve. Defaults to the stock HuggingFace checkpoint; set
 # SMOLVLA_CHECKPOINT to a path on the `molmoact2-checkpoints` volume to serve one of our
@@ -108,31 +116,10 @@ WIRE_TO_FEATURE = {
     "wrist_image": "observation.images.image2",
 }
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "ffmpeg")
-    .pip_install(
-        "torch==2.5.1", "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "HF_HOME": "/cache/huggingface",
-        "TOKENIZERS_PARALLELISM": "false",
-    })
-    .pip_install("hf-transfer>=0.1.8")
-    # `[smolvla]` pulls the SmolVLM2 vision/language deps. Deliberately NOT `[libero]`: that
-    # extra drags in robosuite -> egl_probe, which needs cmake and an OpenGL toolchain and
-    # exists only to run the LIBERO *simulator*. Our simulator is local MuJoCo.
-    # `peft` is needed only when SMOLVLA_CHECKPOINT points at one of our LoRA fine-tunes,
-    # but it is installed unconditionally: no lerobot extra pulls it (smolvla_modal_train.py
-    # found the same thing the hard way), and making it conditional on the env var would
-    # mean the stock and fine-tuned deployments build different images for no benefit --
-    # peft is a few hundred KB of Python.
-    .pip_install("lerobot[smolvla]", "peft", "fastapi[standard]", "json-numpy", "pillow")
-    # Bake the selected checkpoint into the image so the container reads the same value the
-    # deploy was made with, rather than whatever the environment happens to hold at runtime.
-    .env({"SMOLVLA_CHECKPOINT": CHECKPOINT})
+image = with_infra(
+    # Bake the selected checkpoint into the image so the container reads the same value
+    # the deploy was made with. Extras and pins: infra/modal_images.py.
+    lerobot_serve_image().env({"SMOLVLA_CHECKPOINT": CHECKPOINT})
 )
 
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)

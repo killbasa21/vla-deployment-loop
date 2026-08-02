@@ -1,11 +1,11 @@
 """Collect scripted expert demonstrations of the green-ball pick-and-place task, in the
 **LIBERO** convention, for LoRA + action-expert fine-tuning of MolmoAct2-LIBERO.
 
-Not to be confused with `phase4_collect_demos.py` at the repo root. That one records the
+Not to be confused with `droid/phase4_collect_demos.py` at the repo root. That one records the
 **DROID** convention (8-D absolute joint targets, 15 Hz, `scene_pick_place.xml`) for the
 DROID checkpoint. This one records what the LIBERO checkpoint speaks:
 
-                          phase4_collect_demos.py      this file
+                          droid/phase4_collect_demos.py      this file
     action                8-D absolute joint pos       7-D delta eef pose, [-1, 1]
     state                 [q1..q7, gripper_rad]        [eef_pos(3), axisangle(3),
                                                         gripper_qpos(2)], LIBERO frame
@@ -45,7 +45,7 @@ commanded per-tick displacement respectively, so the corrective deltas differ by
 Training on one and serving under the other reintroduces exactly the mismatch above. Every
 plant-calibrated constant in this file (NOISE_SIGMA_POS, RETREAT_BACKOFF*, RECOVER_KICK*,
 and the dwell durations in `waypoints`) was measured on the ik plant and must be
-re-measured, not carried over -- see README.md sec.4.3 for how that sweep is run.
+re-measured, not carried over -- see docs/SERVO_DROOP.md sec.4.3 for how that sweep is run.
 
 THE THREE COHORTS
 -----------------
@@ -95,7 +95,7 @@ BALL_REST_Z = L.TABLE_TOP_Z + BALL_RADIUS
 
 # Bin anchor slots, read off scene_libero_hand.xml. Which colour sits at which slot is
 # shuffled per episode so the model has to LOOK for the green one rather than memorise a
-# fixed coordinate -- the same argument phase4_collect_demos.py makes.
+# fixed coordinate -- the same argument droid/phase4_collect_demos.py makes.
 # Imported, not redeclared: libero_closed_loop.py --randomize-bins draws from the same
 # three slots, and two copies of this list is how the collector and the evaluation end up
 # sampling different distributions without anything erroring.
@@ -651,7 +651,7 @@ def main():
             "action, but what knocks the arm off the reference is the fraction that gets "
             "REALISED -- 72% per tick for the retuned position servo a3/a4 were collected "
             "on, 12.3% for OSC. Carrying a sigma across that change silently changes the "
-            "physical disturbance by ~6x. See README.md sec.4.3 for the sweep that set 0.08"
+            "physical disturbance by ~6x. See docs/SERVO_DROOP.md sec.4.3 for the sweep that set 0.08"
         ),
     )
     p.add_argument(

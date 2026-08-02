@@ -2,7 +2,7 @@
 Minimal LeRobot v2.1 dataset writer (no `lerobot`/torch dependency).
 
 Emits the on-disk layout `LeRobotDataset` expects, so the demos collected by
-phase4_collect_demos.py can be loaded by the LeRobot ecosystem (and, once MolmoAct2's
+droid/phase4_collect_demos.py can be loaded by the LeRobot ecosystem (and, once MolmoAct2's
 fine-tuning code ships, fed to it) without this lightweight client machine having to
 install the full `lerobot` package + its torch stack. We only depend on `pyarrow`
 (parquet) and `imageio[ffmpeg]` (mp4 video encode).

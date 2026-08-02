@@ -1,6 +1,6 @@
 """Render a camera view to a PNG so we can visually check scene layout.
 
-Usage: uv run python phase1_render_check.py [camera_name] [output_path.png]
+Usage: uv run python droid/phase1_render_check.py [camera_name] [output_path.png]
 Both arguments are optional -- defaults to the external_cam and render_check.png.
 """
 

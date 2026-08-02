@@ -1,10 +1,10 @@
 """Serve `allenai/MolmoAct2-LIBERO`'s /act endpoint on a Modal GPU.
 
-Sibling of the project root's `phase3_modal.py`, kept separate (see libero/README.md)
+Sibling of the project root's `droid/phase3_modal.py`, kept separate (see libero/README.md)
 so the DROID deployment stays untouched. Same trick: don't reimplement the server, wrap
 the existing FastAPI app from molmoact2/examples/droid/host_server_droid.py.
 
-Two things differ from phase3_modal.py, and only two:
+Two things differ from droid/phase3_modal.py, and only two:
 
   1. `repo_id` -> "allenai/MolmoAct2-LIBERO"
   2. `NORM_TAG` -> "libero"
@@ -32,49 +32,30 @@ Usage:
     modal deploy libero/libero_modal.py          # persistent, prints the URL
 
 Point libero_closed_loop.py --server-url at the printed URL + "/act". As with
-phase3_modal.py, read the URL off modal's own "Created Web Function URL" line rather
+droid/phase3_modal.py, read the URL off modal's own "Created Web Function URL" line rather
 than reconstructing the slug by hand.
 """
 
+import sys
+from pathlib import Path
+
 import modal
+
+# The shared image definitions live at the repo root, and Modal re-imports this
+# module inside the container -- where infra/ lands on /root via with_infra().
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.modal_images import molmoact_serve_image, with_infra
 
 REPO_ID = "allenai/MolmoAct2-LIBERO"
 # Must match the tag this checkpoint's norm stats are registered under. See the module
 # docstring -- a wrong tag here fails silently, not loudly.
 NORM_TAG = "libero"
 
-# Same pins as phase3_modal.py / molmoact2's pyproject.toml. CLAUDE.md: don't relax
-# these casually -- validated against torch 2.5.1 / transformers 4.57.x.
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "torch==2.5.1",
-        "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .pip_install(
-        "transformers>=4.57,<4.58",
-        "accelerate>=1.0",
-        "safetensors>=0.4",
-        "huggingface-hub[cli]>=0.36",
-        "hf-transfer>=0.1.8",
-        "pillow>=10",
-        "numpy>=1.26,<3",
-        "einops>=0.7",
-        "sentencepiece>=0.2",
-        "protobuf>=4.25",
-        "fastapi>=0.116",
-        "uvicorn[standard]>=0.35",
-        "json-numpy>=2.1.0",
-    )
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": "/cache/huggingface"})
-    .add_local_dir(
-        "molmoact2/examples/droid",
-        remote_path="/root/droid_server",
-    )
-)
+# Pins live in infra/modal_images.py -- change them there, not here. Do not relax them
+# casually: validated against torch 2.5.1 / transformers 4.57.x.
+image = with_infra(molmoact_serve_image())
 
-# Shared with phase3_modal.py on purpose: same HF cache Volume, so the two checkpoints
+# Shared with droid/phase3_modal.py on purpose: same HF cache Volume, so the two checkpoints
 # sit side by side and neither re-downloads when you switch between them.
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)
 

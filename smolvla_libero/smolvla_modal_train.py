@@ -5,7 +5,7 @@ conventions; this one trains it.
 
 WHY SMOLVLA AND NOT MOLMOACT2
 -----------------------------
-`FINE_TUNE_LEARNINGS.md` sec.5.5 records the binding constraint on the MolmoAct2 path: a $5
+`docs/FINE_TUNE_LEARNINGS.md` sec.5.5 records the binding constraint on the MolmoAct2 path: a $5
 budget bought 150 steps = **0.06 epochs**, at which point the honest read was that the
 checkpoint had "barely moved off the base". SmolVLA is 450M against MolmoAct2's 5.57B, so
 the same money buys a real run. It is also already LIBERO-fine-tuned, on a robosuite Panda,
@@ -68,7 +68,15 @@ Usage:
     modal run smolvla_libero/smolvla_modal_train.py --max-steps 3000 --save-freq 750
 """
 
+import sys
+from pathlib import Path
+
 import modal
+
+# The shared image definitions live at the repo root, and Modal re-imports this
+# module inside the container -- where infra/ lands on /root via with_infra().
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.modal_images import lerobot_train_image, with_infra
 
 # a7, the third dataset in this sequence, and the reason for each move is worth keeping:
 #
@@ -95,29 +103,7 @@ BASE_CHECKPOINT = "HuggingFaceVLA/smolvla_libero"
 # Same recipe as smolvla_modal.py so the heavy pip layers are a CACHE HIT rather than a
 # 15-25 minute rebuild. Any divergence here (a different .env, an extra package earlier in
 # the chain) invalidates the cache and costs that time back.
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "ffmpeg")
-    .pip_install(
-        "torch==2.5.1", "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "HF_HOME": "/cache/huggingface",
-        "TOKENIZERS_PARALLELISM": "false",
-    })
-    .pip_install("hf-transfer>=0.1.8")
-    # `[dataset]` on top of the serving image's `[smolvla]`: without it lerobot-train dies
-    # at import with "ImportError: 'datasets' is required but not installed". Found on a
-    # 2-minute CPU container rather than on a rented GPU. The heavy torch layer above is
-    # still shared with smolvla_modal.py, so only this last layer rebuilds.
-    # `peft` is NOT pulled by any lerobot extra, but policies/factory.py imports it
-    # unconditionally as soon as `--policy.use_peft=true`. Without it the run dies at
-    # policy construction, ~30 s in, after the dataset has already been built.
-    .pip_install("lerobot[smolvla,dataset]", "peft", "fastapi[standard]", "json-numpy",
-                 "pillow")
-)
+image = with_infra(lerobot_train_image())
 
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)
 lerobot_data = modal.Volume.from_name("molmoact2-lerobot-data", create_if_missing=True)

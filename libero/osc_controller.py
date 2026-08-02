@@ -12,7 +12,7 @@ long-running problems are artefacts of it rather than of the policy:
      (PROGRESS sec.19: 2.9 mm of penetration under ~70 N). `--min-clearance` exists only
      to fake the yielding a force controller gets for free.
   2. Servo droop -- an overdamped position servo never arrives, so the collector's
-     `(target - current)` label carries a standing sag. The whole of README.md is about
+     `(target - current)` label carries a standing sag. The whole of docs/SERVO_DROOP.md is about
      that bug. A torque controller has no joint setpoint to lag behind.
   3. `IK unreached` -- a hard failure with no analogue in OSC, where the commanded wrench
      simply falls off near a singularity.

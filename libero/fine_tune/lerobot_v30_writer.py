@@ -1,14 +1,14 @@
 """LeRobot **v3.0** dataset writer, shaped to match `allenai/MolmoAct2-LIBERO-Dataset`.
 
-Why this exists when the repo root already has `lerobot_writer.py`: that one emits **v2.1
+Why this exists when the repo root already has `droid/lerobot_writer.py`: that one emits **v2.1
 with mp4 video features**, which is the wrong format twice over for this checkpoint.
 
   1. VERSION. `experiments/lerobot/src/lerobot/datasets/lerobot_dataset.py:83` pins
      `CODEBASE_VERSION = "v3.0"` and raises `BackwardCompatibilityError` on anything older.
-     The v2.1 path only works via the separate `phase4_modal_train.py::convert` step.
+     The v2.1 path only works via the separate `droid/phase4_modal_train.py::convert` step.
   2. IMAGE STORAGE. The released LIBERO dataset has `"video_path": null` and stores each
      frame as PNG bytes **inside the parquet**, in a `struct<bytes, path>` column typed
-     `{"_type": "Image"}` by HuggingFace `datasets`. `lerobot_writer.py` writes one mp4
+     `{"_type": "Image"}` by HuggingFace `datasets`. `droid/lerobot_writer.py` writes one mp4
      per camera per episode instead.
 
 Every field below was read off the released dataset rather than inferred, because a

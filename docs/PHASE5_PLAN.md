@@ -37,7 +37,7 @@ Training data for 2 and 3: 50 IK-scripted expert demos, LeRobot v2.1.
 ### 2.1 Inference runs the arm 33× too fast — **the primary bug**
 
 Demo collection holds each action for `decimation` sim steps
-(`phase4_collect_demos.py:286`):
+(`droid/phase4_collect_demos.py:286`):
 
 ```python
 decimation = int(round((1.0 / model.opt.timestep) / CONTROL_HZ))   # = 33
@@ -47,7 +47,7 @@ for _ in range(decimation):
 
 500 Hz sim / 15 Hz control → **66 ms of physics per action**.
 
-Inference gives each action **one** step (`phase3_closed_loop.py:543`):
+Inference gives each action **one** step (`droid/phase3_closed_loop.py:543`):
 
 ```python
 for i, action in enumerate(actions):
@@ -207,7 +207,7 @@ on. Re-enable bin randomization later.
 
 ### Tier 0 — free, no GPU
 
-1. Fix the decimation bug in `phase3_closed_loop.py` (hold each action for `decimation` steps).
+1. Fix the decimation bug in `droid/phase3_closed_loop.py` (hold each action for `decimation` steps).
 2. Raise gripper pad friction to ~2.0 in the 2F-85 XML.
 3. Make `wrist_cam` a rigid mount — drop `mode="targetbody"`.
 4. Re-frame `external_cam` (~0.8 m standoff, `fovy≈45`) and render **16:9**, not square.

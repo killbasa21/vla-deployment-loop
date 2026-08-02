@@ -18,14 +18,16 @@ Every control tick (~15 Hz, matching DROID) we record, *before* stepping:
   - state (8,) = [q1..q7, gripper_rad]  -- the DROID server's own state schema,
   - action (8,) = [q1..q7 target, gripper_target_rad]  -- absolute joint targets, the
     same thing MolmoAct2-DROID's /act endpoint returns, so a model trained on this data
-    speaks the same wire format phase3_closed_loop.py already consumes.
+    speaks the same wire format droid/phase3_closed_loop.py already consumes.
 
 Only episodes where the ball ends up resting inside the green container are kept.
 
 Usage:
-    uv run python phase4_collect_demos.py --preview           # render 1 episode to an mp4, no dataset
-    uv run python phase4_collect_demos.py --episodes 50        # collect 50 successful demos -> dataset
-    uv run python phase4_collect_demos.py --episodes 50 --out data/green_ball_pick
+    # render 1 episode to an mp4, no dataset
+    uv run python droid/phase4_collect_demos.py --preview
+    # collect 50 successful demos -> dataset
+    uv run python droid/phase4_collect_demos.py --episodes 50
+    uv run python droid/phase4_collect_demos.py --episodes 50 --out data/green_ball_pick
 """
 
 import argparse
@@ -41,7 +43,7 @@ INSTRUCTION = "pick up the green ball and put it in the green container"
 # Gripper conventions. The Panda mounts a Robotiq 2F-85 (see panda.xml). Its
 # fingers_actuator takes ctrl in 0-255 (0=open, 255=closed). MolmoAct2-DROID's gripper
 # axis is the raw radian position of the driver knuckle joint, 0=open .. ~0.8=closed
-# (see phase3_closed_loop.py's long note). We record state/action gripper values in that
+# (see droid/phase3_closed_loop.py's long note). We record state/action gripper values in that
 # DROID radian space and convert to the 0-255 actuator command when driving the sim.
 GRIPPER_CTRL_MAX = 255.0
 GRIPPER_OPEN_RAD = 0.0

@@ -21,16 +21,16 @@ End-to-end goal:
 
 ```
  collect IK demos  ->  LeRobot dataset  ->  fine-tune MolmoAct2-DROID on Modal  ->  serve it
- (phase4_collect_    (data/green_ball_    (phase4_modal_train.py)               (phase3_modal_finetuned.py)
+ (phase4_collect_    (data/green_ball_    (droid/phase4_modal_train.py)               (droid/phase3_modal_finetuned.py)
   demos.py)           pick/)
 ```
 
 The fine-tuned checkpoint speaks the same `/act` wire format as Phase 3, so
-`phase3_closed_loop.py` can keep using the same POST payload. The saved artifact is not
+`droid/phase3_closed_loop.py` can keep using the same POST payload. The saved artifact is not
 the same *file format* as the released Hugging Face checkpoint, though: Phase 4 produced
 an OLMo/PyTorch distributed training checkpoint (`config.yaml`, `model_and_optim/*.distcp`,
-and `train/rank0.pt`). Use `phase3_modal_finetuned.py` to serve that raw checkpoint via
-MolmoAct2's experiments policy server. Keep `phase3_modal.py` for the released base
+and `train/rank0.pt`). Use `droid/phase3_modal_finetuned.py` to serve that raw checkpoint via
+MolmoAct2's experiments policy server. Keep `droid/phase3_modal.py` for the released base
 `allenai/MolmoAct2-DROID` HF checkpoint.
 
 ---
@@ -42,14 +42,14 @@ MolmoAct2's experiments policy server. Keep `phase3_modal.py` for the released b
 | IK method | **MuJoCo numerical IK** (Jacobian damped least squares), not real IKFast | No external toolchain (IKFast needs OpenRAVE codegen), and it handles the Panda's 7-DOF redundancy naturally. Standard for sim demo generators. |
 | Robot / scene | **Reuse `scene_pick_place.xml`** (Panda + Robotiq 2F-85) + add a green ball | Least new surface area; we already trust this scene from Phase 3. |
 | Output format | **LeRobot v2.1**, written directly (parquet + mp4 + meta json) | The format MolmoAct2's trainer reads. Written *without* installing the heavy `lerobot`+torch stack on this laptop, to keep the client light. |
-| State/action convention | **8-D DROID: `[q1..q7, gripper_rad]`** | Identical to what `phase3_closed_loop.py` already sends/receives, so a model trained on this speaks the existing `/act` protocol. |
+| State/action convention | **8-D DROID: `[q1..q7, gripper_rad]`** | Identical to what `droid/phase3_closed_loop.py` already sends/receives, so a model trained on this speaks the existing `/act` protocol. |
 | Fine-tune start point | **`allenai/MolmoAct2-DROID`** | Our data is the DROID embodiment (Franka, absolute joint pose). Fine-tune the checkpoint we've already been serving. |
 
 ---
 
 ## The classical IK expert — how it works
 
-File: **`phase4_collect_demos.py`**
+File: **`droid/phase4_collect_demos.py`**
 
 ### Inverse kinematics as a *planner*
 The IK solver (`solve_ik`) does **not** teleport the robot. It runs on a throwaway copy
@@ -108,7 +108,7 @@ of 33 steps per tick. Every control tick, *before* stepping, we record:
 
 ## The dataset format
 
-File: **`lerobot_writer.py`** — a minimal LeRobot **v2.1** writer with no `lerobot`/torch
+File: **`droid/lerobot_writer.py`** — a minimal LeRobot **v2.1** writer with no `lerobot`/torch
 dependency (only `pyarrow` for parquet + `imageio[ffmpeg]` for mp4).
 
 Layout produced under `--out` (default `data/green_ball_pick/`):
@@ -172,7 +172,7 @@ DROID embodiment, we start fine-tuning from `allenai/MolmoAct2-DROID`.
 
 ## Running training on Modal
 
-File: **`phase4_modal_train.py`** — the training counterpart to `phase3_modal.py`. It
+File: **`droid/phase4_modal_train.py`** — the training counterpart to `droid/phase3_modal.py`. It
 wraps `experiments/launch_scripts/train_lerobot.py` in a Modal container and runs it under
 `torchrun`. It's a **separate image** from the serving one because the trainer needs
 `transformers>=5.3` while the inference server pins `4.57`.
@@ -191,7 +191,7 @@ Three Modal Volumes:
 2. Collect enough data and upload it to the data Volume at the repo_id path the mixture
    expects (`greenbox/green_ball_pick`):
    ```bash
-   uv run python phase4_collect_demos.py --episodes 300 --out data/green_ball_pick
+   uv run python droid/phase4_collect_demos.py --episodes 300 --out data/green_ball_pick
    modal volume create molmoact2-lerobot-data
    modal volume put molmoact2-lerobot-data data/green_ball_pick /greenbox/green_ball_pick
    ```
@@ -201,16 +201,16 @@ Three Modal Volumes:
 ### Run
 ```bash
 modal setup                                              # one-time auth
-modal run phase4_modal_train.py --max-steps 20           # tiny smoke run first
-modal run phase4_modal_train.py                          # action-expert-only, 1 GPU (cheapest)
-modal run phase4_modal_train.py --mode lora              # LoRA
-modal run phase4_modal_train.py --mode full --gpus 8     # full fine-tune (8×80 GB)
+modal run droid/phase4_modal_train.py --max-steps 20           # tiny smoke run first
+modal run droid/phase4_modal_train.py                          # action-expert-only, 1 GPU (cheapest)
+modal run droid/phase4_modal_train.py --mode lora              # LoRA
+modal run droid/phase4_modal_train.py --mode full --gpus 8     # full fine-tune (8×80 GB)
 ```
 Pull the result and serve it:
 ```bash
 modal volume get molmoact2-checkpoints checkpoints/finetune/ae_train ./out
-modal deploy phase3_modal_finetuned.py
-uv run python phase3_closed_loop.py --model-path droid \
+modal deploy droid/phase3_modal_finetuned.py
+uv run python droid/phase3_closed_loop.py --model-path droid \
     --server-url <printed-finetuned-modal-url>/act \
     --request-timeout 600 --chunks 5
 ```
@@ -233,7 +233,7 @@ Training result:
   training, noisy as expected with tiny batches.
 
 Current serving status:
-- `phase3_modal_finetuned.py` has been added to serve the raw DCP checkpoint from the
+- `droid/phase3_modal_finetuned.py` has been added to serve the raw DCP checkpoint from the
   Modal checkpoint volume using `molmoact2/experiments/scripts/serve_policy.py`.
 - It has not yet been deployed or smoke-tested.
 - No simulation has yet been run against the fine-tuned model.
@@ -245,10 +245,10 @@ Current serving status:
 
 | File | What |
 | --- | --- |
-| `phase4_collect_demos.py` | **New.** The IK expert + episode executor + recorder. `--preview`, `--episodes`, `--start-jitter`, `--res`, `--seed`. |
-| `lerobot_writer.py` | **New.** Minimal LeRobot v2.1 dataset writer (parquet + mp4 + meta). |
-| `phase4_modal_train.py` | **New.** Modal wrapper that runs `train_lerobot.py` on a rented GPU. |
-| `phase3_modal_finetuned.py` | **New.** Modal wrapper intended to serve the raw `ae_train/step500` distributed checkpoint via MolmoAct2's experiments policy server. Added but not yet deployed/smoke-tested. |
+| `droid/phase4_collect_demos.py` | **New.** The IK expert + episode executor + recorder. `--preview`, `--episodes`, `--start-jitter`, `--res`, `--seed`. |
+| `droid/lerobot_writer.py` | **New.** Minimal LeRobot v2.1 dataset writer (parquet + mp4 + meta). |
+| `droid/phase4_modal_train.py` | **New.** Modal wrapper that runs `train_lerobot.py` on a rented GPU. |
+| `droid/phase3_modal_finetuned.py` | **New.** Modal wrapper intended to serve the raw `ae_train/step500` distributed checkpoint via MolmoAct2's experiments policy server. Added but not yet deployed/smoke-tested. |
 | `fine_tunes/pick_up_tasks/ae_train/run_20260719_ae500/run_info.md` | **New.** Metadata and result notes for the completed `ae_train` fine-tune. |
 | `mujoco_menagerie/franka_emika_panda/scene_pick_place.xml` | **Changed.** Added the graspable `green_ball` (freejoint sphere, r=2 cm) as the pick target. |
 | `molmoact2/experiments/launch_scripts/data_mixtures.py` | **Changed (vendored).** Registered the `green_ball_pick` mixture. |
@@ -258,21 +258,21 @@ Current serving status:
 
 ```bash
 # 1. See one episode as a video (no dataset written)
-uv run python phase4_collect_demos.py --preview --seed 1        # -> assets/phase4_preview.mp4
+uv run python droid/phase4_collect_demos.py --preview --seed 1        # -> assets/phase4_preview.mp4
 
 # 2. Collect a dataset
-uv run python phase4_collect_demos.py --episodes 300 --out data/green_ball_pick
+uv run python droid/phase4_collect_demos.py --episodes 300 --out data/green_ball_pick
 
 # 3. (prereqs) populate lerobot submodule + upload dataset to Modal (see above)
 
 # 4. Fine-tune on Modal
-modal run phase4_modal_train.py --max-steps 20                  # smoke test
-modal run phase4_modal_train.py                                 # real run (action-expert-only)
+modal run droid/phase4_modal_train.py --max-steps 20                  # smoke test
+modal run droid/phase4_modal_train.py                                 # real run (action-expert-only)
 
 # 5. Retrieve + serve the fine-tuned checkpoint
 modal volume get molmoact2-checkpoints checkpoints/finetune/ae_train ./out
-modal deploy phase3_modal_finetuned.py
-uv run python phase3_closed_loop.py --model-path droid \
+modal deploy droid/phase3_modal_finetuned.py
+uv run python droid/phase3_closed_loop.py --model-path droid \
     --server-url <printed-finetuned-modal-url>/act \
     --request-timeout 600 --chunks 5
 ```

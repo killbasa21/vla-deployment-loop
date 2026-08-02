@@ -1,7 +1,7 @@
 """
 Phase 0, step 2: manual control via the viewer's own UI, no scripted motion.
 
-Unlike phase0_hello_panda.py, this script never touches data.ctrl itself after
+Unlike droid/phase0_hello_panda.py, this script never touches data.ctrl itself after
 the initial reset -- it just holds the home pose and steps physics, so YOU can
 drive the robot instead:
 

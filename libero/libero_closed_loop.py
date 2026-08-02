@@ -1,6 +1,6 @@
 """Closed-loop MolmoAct2-LIBERO control of the MuJoCo Panda pick-and-place scene.
 
-Self-contained sibling of the project root's `phase3_closed_loop.py`. Deliberately a
+Self-contained sibling of the project root's `droid/phase3_closed_loop.py`. Deliberately a
 copy rather than an import (see libero/README.md): the two speak different action
 spaces, and keeping them separate means experimenting here can't break the DROID path.
 
@@ -44,7 +44,7 @@ libero/tools/verify_osc.py, all four checks passing:
 
   droop         position servo sags 4.84 mm at rest, so the collector's
                 (target - current) label carries a standing bias into EVERY frame --
-                the subject of the whole top-level README.md. OSC sags 0.000 mm, because
+                the subject of the whole `docs/SERVO_DROOP.md`. OSC sags 0.000 mm, because
                 there is no joint setpoint to lag behind. It also makes the settled eef
                 height 0.2728 against LIBERO's 0.2733, i.e. the 0.5 mm match the docs
                 always claimed but which was really a pure-FK number (README sec.1.1).
@@ -394,7 +394,7 @@ def read_state(model, data, site_id, finger_qposadr):
 def _orientation_error(target_mat, current_mat):
     """Rotation vector (axis*angle, world frame) taking current -> target. Both inputs
     are flat length-9 rotation matrices (data.site_xmat form). Copied verbatim from
-    phase4_collect_demos.py so both paths solve identical IK."""
+    droid/phase4_collect_demos.py so both paths solve identical IK."""
     cur_q = np.zeros(4)
     tgt_q = np.zeros(4)
     mujoco.mju_mat2Quat(cur_q, current_mat)
@@ -557,6 +557,98 @@ def apply_action_osc(osc, data, action):
     return True, float(np.linalg.norm(dpos)), clamped
 
 
+def probe_health(server_url, timeout=30):
+    """GET /health on the same host as the /act URL. Returns {} on any failure.
+
+    Never fatal: a server that does not implement /health (the MolmoAct2 host server did not
+    always) must not stop a rollout. The only thing this drives is where artifacts land.
+    """
+    base = server_url.rstrip("/")
+    for suffix in ("/act", "/predict"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    for path in ("/health", "/healthz"):
+        try:
+            resp = requests.get(base + path, timeout=timeout)
+            if resp.ok:
+                body = resp.json()
+                if isinstance(body, dict):
+                    return body
+        except Exception:
+            continue
+    return {}
+
+
+def derive_run_layout(checkpoint):
+    """(model, fine_tune) for the artifact tree, from a /health 'checkpoint' string.
+
+    Two shapes appear in practice:
+
+      HuggingFaceVLA/smolvla_libero
+          -> ("smolvla_libero", "stock")        an unmodified released checkpoint
+
+      /checkpoints/act/act-green-ball/checkpoints/010000/pretrained_model
+          -> ("act", "act-green-ball_010000")   one of ours on the Modal volume
+
+      /checkpoints/checkpoints/finetune/libero-green-ball/step150-merged
+          -> ("finetune", "libero-green-ball_step150-merged")
+
+    Anything unrecognised falls back to ("unknown-model", "unknown"), which is deliberately
+    ugly: a run whose provenance could not be determined should look wrong in `ls`. Pass
+    --model/--fine-tune when the derived name is not the one you want to compare under.
+    """
+    if not checkpoint or not isinstance(checkpoint, str):
+        return "unknown-model", "unknown"
+
+    parts = [p for p in checkpoint.strip("/").split("/") if p]
+    if not parts:
+        return "unknown-model", "unknown"
+
+    # An HF repo id: exactly "<org>/<name>", no leading slash. Released, unmodified.
+    if not checkpoint.startswith("/") and len(parts) == 2:
+        return parts[1], "stock"
+    if len(parts) == 1:
+        return parts[0], "stock"
+
+    # A volume path. "checkpoints" is noise -- it is both the volume's mount point and a
+    # real directory inside the act/ and smolvla/ trees, so it identifies nothing. What is
+    # left reads <family>/<run>/<step>.
+    NOISE = {"checkpoints", "checkpoint", "pretrained_model"}
+    meaningful = [p for p in parts if p not in NOISE]
+    if not meaningful:
+        return "unknown-model", "unknown"
+
+    family = meaningful[0]
+    if len(meaningful) >= 3:
+        fine_tune = f"{meaningful[-2]}_{meaningful[-1]}"
+    elif len(meaningful) == 2:
+        fine_tune = meaningful[1]
+    else:
+        fine_tune = "stock"
+    return family, fine_tune
+
+
+def resolve_artifact_dirs(assets_dir, run_id, model, fine_tune, server_url,
+                          probe=True, timeout=30):
+    """Build <assets>/<model>/<fine-tune>/{logs,images/<run_id>}.
+
+    Grouping by policy is the whole point: a flat assets/logs/ made a10-run comparison a
+    manual filename-prefix exercise, and mixing two checkpoints' rollouts in one directory
+    is how a fine-tune gets scored against another fine-tune's logs.
+    """
+    if (model is None or fine_tune is None) and probe:
+        health = probe_health(server_url, timeout=timeout)
+        auto_model, auto_fine_tune = derive_run_layout(health.get("checkpoint"))
+        model = model or auto_model
+        fine_tune = fine_tune or auto_fine_tune
+    model = model or "unknown-model"
+    fine_tune = fine_tune or "unknown"
+
+    root = Path(assets_dir) / model / fine_tune
+    return root / "logs" / f"{run_id}.jsonl", root / "images" / run_id, model, fine_tune
+
+
 def query_server(main_img, wrist_img, state, server_url, send_wrist=True, timeout=30,
                  payload_keys="droid"):
     """POST one observation and return (actions, server_dt_ms, request_bytes)."""
@@ -620,7 +712,7 @@ FREE_BODY_INITIAL_POSES = {
 # NOTE both follow TABLE_TOP_Z, so raising the table on 2026-07-28 carried them with it.
 # Ball sampling box, kept on the table surface and around its centre (0.56, 0) so the
 # ball stays inside the 0.8x0.8 m top and within comfortable reach. Deliberately tighter
-# than phase4_collect_demos.py's floor-scene box, which was anchored to a different frame.
+# than droid/phase4_collect_demos.py's floor-scene box, which was anchored to a different frame.
 BALL_SAMPLE_X = (0.46, 0.66)
 BALL_SAMPLE_Y = (-0.12, 0.12)
 TRACKED_OBJECT_CANDIDATES = ("green_ball", "red_box")
@@ -833,6 +925,23 @@ def main():
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument("--assets-dir", default="assets")
     parser.add_argument("--run-id", default=None)
+    parser.add_argument(
+        "--model", default=None,
+        help=(
+            "policy family this run is evaluating -- the first level of the artifact tree, "
+            "<assets-dir>/<model>/<fine-tune>/. Default: read from the server's /health "
+            "'checkpoint' field, falling back to 'unknown-model' if the server does not "
+            "report one. Set it explicitly whenever you care where the run lands."
+        ),
+    )
+    parser.add_argument(
+        "--fine-tune", default=None,
+        help=(
+            "which checkpoint of that family -- the second level of the artifact tree. "
+            "Default: derived from /health alongside --model ('stock' for an unmodified HF "
+            "repo id, '<run>_<step>' for a checkpoint on the Modal volume)."
+        ),
+    )
     parser.add_argument("--randomize-ball", action="store_true")
     parser.add_argument(
         "--randomize-bins", action="store_true",
@@ -1042,13 +1151,13 @@ def main():
           else f"replan: after {args.replan_at} action(s)")
 
     run_id = args.run_id or f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    assets = Path(args.assets_dir)
-    logs_dir = assets / "logs"
-    images_dir = assets / "images" / run_id
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path, images_dir, model_name, fine_tune_name = resolve_artifact_dirs(
+        args.assets_dir, run_id, args.model, args.fine_tune, args.server_url,
+        timeout=min(args.request_timeout, 30.0),
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     if not args.dry_run:
         images_dir.mkdir(parents=True, exist_ok=True)
-    log_path = logs_dir / f"{run_id}.jsonl"
     # Say out loud which scene layout this run is scored against. Bin randomisation is
     # opt-in (--randomize-bins, off by default), but "off by default" is not the same as
     # "visible", and a run whose placement target moved is not comparable to one whose did
@@ -1064,7 +1173,9 @@ def main():
         print(f"green bin: ({green_bin_xy[0]:.3f}, {green_bin_xy[1]:.3f}) "
               f"-- scene XML layout, bins not randomised")
 
-    print(f"run_id: {run_id}\n  log:    {log_path}\n  images: {images_dir}/")
+    print(f"run_id: {run_id}\n  policy: {model_name}/{fine_tune_name}"
+          f"{'  (from /health)' if args.model is None or args.fine_tune is None else ''}"
+          f"\n  log:    {log_path}\n  images: {images_dir}/")
 
     executor = None if args.dry_run else ThreadPoolExecutor(max_workers=1)
     pending = None
@@ -1172,6 +1283,11 @@ def main():
                 # i.e. a policy failure, which is exactly the wrong conclusion. 0 = "until
                 # killed", where no completeness claim is possible.
                 "chunks_requested": args.chunks,
+                # Which policy this log belongs to, duplicated from the directory it sits in
+                # (<assets>/<model>/<fine-tune>/logs/). The path is the index; this is so a
+                # log that gets copied out of the tree still says what produced it.
+                "model": model_name,
+                "fine_tune": fine_tune_name,
                 "env_state": env_state_before,
                 "model_output": {
                     "actions": actions.tolist(),
@@ -1291,7 +1407,7 @@ def main():
             log_f.write(json.dumps(log_entry) + "\n")
             log_f.flush()
 
-        # Same deterministic teardown order as phase3_closed_loop.py: close the
+        # Same deterministic teardown order as droid/phase3_closed_loop.py: close the
         # offscreen renderer's GL context before the passive viewer's GLFW teardown,
         # otherwise MuJoCo can abort with "free(): invalid pointer".
         renderer.close()

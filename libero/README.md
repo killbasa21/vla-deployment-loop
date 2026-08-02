@@ -1,7 +1,7 @@
 # `libero/` — MolmoAct2-LIBERO closed loop
 
 Self-contained port of the phase-3 closed loop to the **`allenai/MolmoAct2-LIBERO`**
-checkpoint. Deliberately decoupled from `phase3_closed_loop.py` (copy-paste, not import)
+checkpoint. Deliberately decoupled from `droid/phase3_closed_loop.py` (copy-paste, not import)
 so the DROID path keeps working untouched while this one is in flux.
 
 > **2026-07-28 (later): Route A replaced by a native OSC port — see `PROGRESS.md` §22
@@ -33,7 +33,7 @@ two-camera layout. The sim-to-real visual gap and the FR3/Panda mismatch both di
 
 ## Conventions (verified against the vendored repo)
 
-| | DROID (`phase3_closed_loop.py`) | LIBERO (here) | source |
+| | DROID (`droid/phase3_closed_loop.py`) | LIBERO (here) | source |
 |---|---|---|---|
 | `norm_tag` | `franka_droid` | **`libero`** | `data_mixtures.py:322` |
 | `setup_type` | `single franka robotic arm in droid` | `single franka robotic arm in libero` | `data_mixtures.py:331` |
@@ -278,7 +278,7 @@ verbatim would put the site 5.9 mm *behind* our pads where LIBERO's sits 3.6 mm 
 of its own. What the checkpoint learned is the relationship, so that is what is
 reproduced (`0.1029 + 0.0036`). Change the one number if you want the literal value.
 
-### Correction to `PHASE5_PLAN.md` Tier B
+### Correction to `docs/PHASE5_PLAN.md` Tier B
 
 The plan says `wrist_cam` "re-aims every frame", "pinning the target near center", and
 that this "deleted the best cue for the last centimetre." That is **not** what the XML
@@ -313,9 +313,11 @@ MUJOCO_GL=egl uv run python libero/tools/verify_osc.py
 `--model-path` defaults to whichever scene matches `--control-mode`; pass it only to
 override.
 
-Artifacts follow the same layout as phase 3 (`assets/logs/<run_id>.jsonl`,
-`assets/images/<run_id>/`), with `image` / `wrist_image` camera names instead of
-`external_cam` / `wrist_cam`.
+Artifacts land under `assets/<model>/<fine-tune>/logs/<run_id>.jsonl` and
+`.../images/<run_id>/`, with `image` / `wrist_image` camera names instead of
+`external_cam` / `wrist_cam`. `--model` / `--fine-tune` set the two directory levels; leave
+them off and they are derived from the server's `/health` checkpoint. See the root
+`README.md`, "Run artifacts".
 
 ### Two things to expect when watching a run
 

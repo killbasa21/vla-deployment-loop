@@ -7,15 +7,15 @@ Format per entry: **what we tried** → **what the result was**. Wrong turns are
 including mine — several conclusions in this log were reversed by later measurements, and
 knowing *which* were reversed is the useful part.
 
-Companion docs: `libero/README.md` (current conventions, the spec), `PHASE5_PLAN.md`
-(the diagnosis this came out of — see "Corrections to PHASE5_PLAN.md" at the bottom).
+Companion docs: `libero/README.md` (current conventions, the spec), `docs/PHASE5_PLAN.md`
+(the diagnosis this came out of — see "Corrections to docs/PHASE5_PLAN.md" at the bottom).
 
 ---
 
 ## 1. Decimation: inference ran the arm 33× too fast
 
-**Tried.** `phase3_closed_loop.py` called `mj_step` exactly once per action. Demo
-collection (`phase4_collect_demos.py:283-287`) holds each action for
+**Tried.** `droid/phase3_closed_loop.py` called `mj_step` exactly once per action. Demo
+collection (`droid/phase4_collect_demos.py:283-287`) holds each action for
 `decimation = round(500/15) = 33` steps. So each command got 2 ms of physics at inference
 instead of the 66 ms it was recorded with. Fixed by wrapping the step in a `decimation`
 loop; added `--decimation` to override.
@@ -126,7 +126,7 @@ can only learn the average trajectory over the ball's randomization box.
 That matches the observed symptom (claw closing consistently to one side of the ball =
 executing a learned average rather than localizing). So LoRA is *required*, not optional.
 
-This also **contradicts `PHASE5_PLAN.md` §2.2** ("nothing converged"). The AE converged
+This also **contradicts `docs/PHASE5_PLAN.md` §2.2** ("nothing converged"). The AE converged
 fine. What didn't converge is task success — the classic BC gap the plan's own Rung 2
 caveat warns about.
 
@@ -202,7 +202,7 @@ was ~0.8 m outside the training distribution.
 - First measured "28×21 px, so not sub-patch, the plan's 7 px figure is wrong." **The
   detector was counting the `green_bin`, which is also green.** Retracted.
 - Analytic geometry is authoritative: at `scene_pick_place.xml`'s framing (1.445 m
-  standoff, fovy 71.5) a 40 mm ball is **4.9 px @256, 7.3 px @378**. `PHASE5_PLAN.md`'s
+  standoff, fovy 71.5) a 40 mm ball is **4.9 px @256, 7.3 px @378**. `docs/PHASE5_PLAN.md`'s
   ~7 px was right all along. Sub-patch, unlocalizable.
 - Worse: rendering at LIBERO's native 256² made it *worse* than 378².
 
@@ -243,7 +243,7 @@ it. Sign errors are invisible in the numbers and obvious in the image.
 
 ## 9. `mode="targetbody"` does not re-aim — plan correction
 
-**Tried.** Assumed, per `PHASE5_PLAN.md` Tier B, that `wrist_cam` "re-aims every frame".
+**Tried.** Assumed, per `docs/PHASE5_PLAN.md` Tier B, that `wrist_cam` "re-aims every frame".
 
 **Result.** False. The camera and its target `grasp_target` are children of the **same
 `base` body**, so the view direction in the gripper frame is constant — measured across
@@ -505,7 +505,7 @@ and item 3 turned out to be robosuite's number rather than DROID's:*
    gripper approach axis). Cheap, principled, removes a known bias.
 2. Add compliance. Either clamp the IK target so it cannot go below the table surface
    (blunt but immediate), or lower the actuator gains / add force limiting (closer to OSC).
-3. Only then revisit pad friction (`PHASE5_PLAN.md` Tier B: 0.7/0.6 vs DROID's 2.0).
+3. Only then revisit pad friction (`docs/PHASE5_PLAN.md` Tier B: 0.7/0.6 vs DROID's 2.0).
 
 ---
 
@@ -990,7 +990,7 @@ absolute joint target.
 
 Three things this closes:
 
-- **Droop is gone, exactly.** Sag is 1e-16, not "small". README.md is *entirely* about a bug
+- **Droop is gone, exactly.** Sag is 1e-16, not "small". docs/SERVO_DROOP.md is *entirely* about a bug
   that only exists because an overdamped position servo never arrives — the collector's
   `(target - current)` label carried that sag into every frame. A torque controller has no
   joint setpoint to lag behind. It also incidentally makes README §1.1's documentation error
@@ -1518,7 +1518,7 @@ binding constraint was a binary channel that neither dataset teaches reliably.
 
 ---
 
-## Corrections to `PHASE5_PLAN.md`
+## Corrections to `docs/PHASE5_PLAN.md`
 
 Things the plan asserts that later measurement contradicted:
 
@@ -1560,7 +1560,7 @@ Things the plan asserts that later measurement contradicted:
   `eye_in_hand`, copied verbatim.
 - ~~Pad friction 0.7/0.6 vs 2.0~~ **RESOLVED in §16**: the stock hand carries robosuite's
   own `friction="2 0.05 0.0001"` / `solref="0.01 0.5"`. (The 2.0 is robosuite's number,
-  not DROID's, as `PHASE5_PLAN.md` Tier B has it.)
+  not DROID's, as `docs/PHASE5_PLAN.md` Tier B has it.)
 - **Fine-tune data is generated but unproven.** `libero/fine_tune/a1` (20 reach / 20
   noise / 10 recover) and `a2` (10 Hz probe) are written in the released dataset's exact
   v3.0 schema, but nothing has loaded them through `LeRobotDataset` and no training run has

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Periodically copies the latest external ("standing") and wrist camera frames
-# from a running phase3_closed_loop.py session into trial/, timestamped, so
+# from a running droid/phase3_closed_loop.py session into trial/, timestamped, so
 # there's an easy-to-browse sample of the feed without digging through the
 # full sequentially-numbered frame dump.
 #

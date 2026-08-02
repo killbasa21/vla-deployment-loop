@@ -46,7 +46,15 @@ weights. `instruction` is accepted and dropped, so the client needs no special-c
 
 import os
 
+import sys
+from pathlib import Path
+
 import modal
+
+# The shared image definitions live at the repo root, and Modal re-imports this
+# module inside the container -- where infra/ lands on /root via with_infra().
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.modal_images import lerobot_serve_image, with_infra
 
 # Absolute path on the checkpoints volume, or an HF repo id. No default that points at a real
 # run: a stale default is how the wrong checkpoint gets measured.
@@ -67,24 +75,12 @@ WIRE_TO_FEATURE = {
     "wrist_image": "observation.images.wrist_image",
 }
 
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "ffmpeg")
-    .pip_install(
-        "torch==2.5.1", "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "HF_HOME": "/cache/huggingface",
-        "TOKENIZERS_PARALLELISM": "false",
-    })
-    .pip_install("hf-transfer>=0.1.8")
-    # Identical layer list to act_modal_train.py and smolvla_modal.py so the heavy torch pull
-    # is a cache hit. `[smolvla]` is dead weight for ACT but keeping the chain identical is
-    # worth more than the wheels it saves.
-    .pip_install("lerobot[smolvla]", "peft", "fastapi[standard]", "json-numpy", "pillow")
-    .env({"ACT_CHECKPOINT": CHECKPOINT})
+image = with_infra(
+    # Serving extras and the torch layer below them are defined once in
+    # infra/modal_images.py, shared with act_modal_train.py and the SmolVLA servers so
+    # the multi-GB torch pull is a cache hit. The checkpoint is baked in so the container
+    # reads the value the deploy was made with, not whatever the env holds at runtime.
+    lerobot_serve_image().env({"ACT_CHECKPOINT": CHECKPOINT})
 )
 
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)

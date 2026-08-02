@@ -1,14 +1,14 @@
 """
 Phase 4 (Modal variant): fine-tune MolmoAct2-DROID on our IK-scripted green-ball
 pick-and-place LeRobot dataset, on a rented Modal GPU -- the training counterpart to
-phase3_modal.py (which serves inference on Modal).
+droid/phase3_modal.py (which serves inference on Modal).
 
 This does not reimplement the trainer. It wraps molmoact2/experiments'
 `launch_scripts/train_lerobot.py` inside a Modal container and runs it via `torchrun`,
 starting from the same `allenai/MolmoAct2-DROID` checkpoint phase3 serves and pointing
 it at the `green_ball_pick` mixture we registered in
 `molmoact2/experiments/launch_scripts/data_mixtures.py`. The output checkpoint is a
-MolmoAct2-DROID-shaped snapshot, so phase3_modal.py can serve it unchanged afterwards.
+MolmoAct2-DROID-shaped snapshot, so droid/phase3_modal.py can serve it unchanged afterwards.
 
 =========================  PREREQUISITES (do these first)  =====================
 
@@ -17,7 +17,7 @@ MolmoAct2-DROID-shaped snapshot, so phase3_modal.py can serve it unchanged after
 
 2. Upload the collected dataset to the Modal data Volume (repo_id path must match the
    mixture: greenbox/green_ball_pick under LEROBOT_DATA_ROOT):
-       uv run python phase4_collect_demos.py --episodes 300 --out data/green_ball_pick
+       uv run python droid/phase4_collect_demos.py --episodes 300 --out data/green_ball_pick
        modal volume create molmoact2-lerobot-data            # first time only
        modal volume put molmoact2-lerobot-data data/green_ball_pick /greenbox/green_ball_pick
 
@@ -27,10 +27,13 @@ MolmoAct2-DROID-shaped snapshot, so phase3_modal.py can serve it unchanged after
 ===============================  RUN  ==========================================
 
     modal setup                                              # one-time auth
-    modal run phase4_modal_train.py                          # action-expert-only, 1 GPU (cheapest)
-    modal run phase4_modal_train.py --mode lora  --gpus 1    # LoRA on the VLM path + full action expert
-    modal run phase4_modal_train.py --mode full  --gpus 8    # full fine-tune (8x80GB, per Ai2's own recipe)
-    modal run phase4_modal_train.py --max-steps 20 --mode ae_only   # tiny smoke run
+    # action-expert-only, 1 GPU (cheapest)
+    modal run droid/phase4_modal_train.py
+    # LoRA on the VLM path + full action expert
+    modal run droid/phase4_modal_train.py --mode lora  --gpus 1
+    # full fine-tune (8x80GB, per Ai2's own recipe)
+    modal run droid/phase4_modal_train.py --mode full  --gpus 8
+    modal run droid/phase4_modal_train.py --max-steps 20 --mode ae_only   # tiny smoke run
 
 Checkpoints land on the `molmoact2-checkpoints` Volume under
 checkpoints/finetune/<exp_name>/ ; pull them locally with
@@ -46,12 +49,12 @@ import modal
 
 # --- Image ------------------------------------------------------------------
 # The *training* package needs transformers>=5.3 (experiments/pyproject.toml), which is
-# a DIFFERENT pin from the inference server's 4.57 in phase3_modal.py -- so this is a
+# a DIFFERENT pin from the inference server's 4.57 in droid/phase3_modal.py -- so this is a
 # separate image, not a reuse of the serving one. torch from the cu121 index to match
 # the GPU; everything else comes from experiments' own `.[all]` extra + lerobot's.
 image = (
     # Python 3.12: the vendored lerobot fork requires >=3.12 (the inference server in
-    # phase3_modal.py can use 3.11, but the training-side lerobot install cannot).
+    # droid/phase3_modal.py can use 3.11, but the training-side lerobot install cannot).
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "ffmpeg")
     .pip_install(
@@ -101,7 +104,7 @@ checkpoints = modal.Volume.from_name("molmoact2-checkpoints", create_if_missing=
 app = modal.App("molmoact2-droid-train")
 
 # Base checkpoint for DROID-embodiment fine-tuning (experiments/README.md checkpoint
-# table). Same weights phase3_modal.py serves -- we adapt them, then serve the result.
+# table). Same weights droid/phase3_modal.py serves -- we adapt them, then serve the result.
 START_CHECKPOINT = "allenai/MolmoAct2-DROID"
 DEFAULT_MIXTURE = "green_ball_pick"  # registered in data_mixtures.py by us
 
@@ -180,7 +183,7 @@ def train(mode: str = "ae_only", gpus: int = 1, max_steps: int = 50000,
         f"--save_interval={save_interval}", "--save_num_checkpoints_to_keep=5",
         f"--save_folder={save_folder}",
         "--packing=false", "--dynamic_seq_len=true",
-        # Our lerobot_writer.py computes min/max/mean/std but not q01/q99 percentiles, so
+        # Our droid/lerobot_writer.py computes min/max/mean/std but not q01/q99 percentiles, so
         # override the trainer's default norm_mode=q01_q99 (which would raise "requires
         # stats keys ['q01','q99']"). min_max maps each dim to a bounded range from the
         # observed extremes -- fine for our clean scripted data, and the fine-tuned
@@ -227,7 +230,7 @@ def train(mode: str = "ae_only", gpus: int = 1, max_steps: int = 50000,
     timeout=3600,
 )
 def convert_v21_to_v30(repo_id: str = "greenbox/green_ball_pick"):
-    """One-time: our lerobot_writer.py emits LeRobot v2.1, but this repo's lerobot fork
+    """One-time: our droid/lerobot_writer.py emits LeRobot v2.1, but this repo's lerobot fork
     only loads v3.0 (BackwardCompatibilityError otherwise). Run the fork's own converter
     on the volume copy, in place (--push-to-hub=false). Leaves a `<name>_old` v2.1 backup
     beside it. Idempotent enough: re-running after conversion would fail the v2.1 check,
@@ -246,7 +249,7 @@ def convert_v21_to_v30(repo_id: str = "greenbox/green_ball_pick"):
 
 @app.local_entrypoint()
 def convert(repo_id: str = "greenbox/green_ball_pick"):
-    """`modal run phase4_modal_train.py::convert` -- convert the uploaded v2.1 dataset to
+    """`modal run droid/phase4_modal_train.py::convert` -- convert the uploaded v2.1 dataset to
     v3.0 on the volume. Run once before training."""
     convert_v21_to_v30.remote(repo_id=repo_id)
 
@@ -256,7 +259,7 @@ def main(mode: str = "ae_only", gpus: int = 1, max_steps: int = 50000,
          device_batch_size: int = 1, global_batch_size: int = 8,
          save_interval: int = 5000, log_interval: int = 20,
          exp_name: str = "green-ball", mixture: str = DEFAULT_MIXTURE):
-    """`modal run phase4_modal_train.py [--mode ...] [--gpus ...] [--max-steps ...]`.
+    """`modal run droid/phase4_modal_train.py [--mode ...] [--gpus ...] [--max-steps ...]`.
 
     Selects the GPU count on the fly so `--gpus 8` requests an 8-GPU container for full
     fine-tuning while the default single-GPU run stays cheap."""

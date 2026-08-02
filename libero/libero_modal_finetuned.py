@@ -4,7 +4,7 @@ Third member of the family, and the differences between them are all that matter
 
   libero/libero_modal.py            released allenai/MolmoAct2-LIBERO, HF format,
                                     loaded by examples/droid/host_server_droid.py
-  phase3_modal_finetuned.py         our DROID fine-tune, OLMo DCP format,
+  droid/phase3_modal_finetuned.py         our DROID fine-tune, OLMo DCP format,
                                     loaded by experiments/scripts/serve_policy.py
   THIS FILE                         our LIBERO fine-tune, OLMo DCP format, serve_policy.py
 
@@ -15,7 +15,7 @@ Everything below is a consequence of those two axes (which checkpoint, which loa
    option. `scripts/serve_policy.py` rebuilds the model from the shards and serves the
    same `/act` wire protocol.
 
-2. MERGED, NOT RAW, FOR A LoRA RUN. `phase3_modal_finetuned.py` paid for this lesson:
+2. MERGED, NOT RAW, FOR A LoRA RUN. `droid/phase3_modal_finetuned.py` paid for this lesson:
    the serving path builds a plain non-PEFT architecture unconditionally, so a raw
    `stepN` checkpoint of a PEFT-wrapped training model has parameter names
    (`base_layer`/`lora_A`/`lora_B`) that do not line up. Point CHECKPOINT_PATH at
@@ -23,7 +23,7 @@ Everything below is a consequence of those two axes (which checkpoint, which loa
    deltas folded into the base weights. (An `ae_only` run has no PEFT wrapping and loads
    either way, which is exactly why this trap survived to bite the LoRA run.)
 
-3. NORM_TAG = "libero". The trap NEXT_STEPS_FOR_FINE_TUNE.md flags:
+3. NORM_TAG = "libero". The trap docs/NEXT_STEPS_FOR_FINE_TUNE.md flags:
    `host_server_droid.py` hardcodes `NORM_TAG = "franka_droid"` at module level, and a
    wrong tag yields garbage actions OF THE CORRECT SHAPE -- a silent failure. This file
    does not go through that module at all, but the same rule applies: the tag must match
@@ -45,12 +45,20 @@ Usage:
 
 import os
 
+import sys
+from pathlib import Path
+
 import modal
+
+# The shared image definitions live at the repo root, and Modal re-imports this
+# module inside the container -- where infra/ lands on /root via with_infra().
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.modal_images import molmoact_experiments_image, with_infra
 
 # Which checkpoint to serve. Override without editing the file:
 #     MOLMOACT2_LIBERO_CKPT=/checkpoints/checkpoints/finetune/libero-green-ball/step200-merged \\
 #         modal deploy libero/libero_modal_finetuned.py
-# Checkpoint SELECTION is part of the anti-overfitting plan (FINE_TUNE_LEARNINGS.md sec.1):
+# Checkpoint SELECTION is part of the anti-overfitting plan (docs/FINE_TUNE_LEARNINGS.md sec.1):
 # the last checkpoint is not automatically the best, so each saved step gets deployed and
 # scored, and the env var is how you switch between them without a code edit.
 CHECKPOINT_PATH = os.environ.get(
@@ -69,25 +77,8 @@ NORM_TAG = "libero"
 # Same image as libero_modal_train.py: serving a DCP checkpoint needs the exact code that
 # trained it. Kept byte-identical to the training image's install steps so Modal reuses
 # the cached layers instead of rebuilding ~20 minutes of pip.
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "ffmpeg")
-    .pip_install(
-        "torch==2.5.1", "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "HF_HOME": "/cache/huggingface",
-        "TOKENIZERS_PARALLELISM": "false",
-        "MOLMOACT2_LIBERO_CKPT": CHECKPOINT_PATH,
-    })
-    .pip_install("hf-transfer>=0.1.8")
-    .add_local_dir("molmoact2/experiments", remote_path="/root/experiments", copy=True)
-    .run_commands(
-        "cd /root/experiments && pip install -e '.[all]'",
-        "cd /root/experiments && pip install -e './lerobot[async]'",
-    )
+image = with_infra(
+    molmoact_experiments_image({"MOLMOACT2_LIBERO_CKPT": CHECKPOINT_PATH})
 )
 
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)

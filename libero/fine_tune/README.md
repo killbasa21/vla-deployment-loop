@@ -126,9 +126,9 @@ meta/episodes/chunk-000/file-000.parquet  one row per episode + flattened per-ep
 data/chunk-000/file-000.parquet           ALL episodes concatenated, rolled over at 100 MB
 ```
 
-Two traps, both of which the repo-root `lerobot_writer.py` falls into:
+Two traps, both of which the repo-root `droid/lerobot_writer.py` falls into:
 
-- **It writes v2.1.** That path only works via `phase4_modal_train.py::convert`.
+- **It writes v2.1.** That path only works via `droid/phase4_modal_train.py::convert`.
 - **It writes mp4 video features.** The released LIBERO dataset has `"video_path": null`
   and stores every frame as **PNG bytes inline in the parquet**, in a
   `struct<bytes, path>` column typed `{"_type": "Image"}` by HuggingFace `datasets`.

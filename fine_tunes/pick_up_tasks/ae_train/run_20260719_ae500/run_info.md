@@ -12,7 +12,7 @@ Action-expert-only fine-tune of MolmoAct2-DROID on the green-ball pick-and-place
 
 ## Dataset
 - LeRobot repo id `greenbox/green_ball_pick`, 50 episodes / 6050 frames, 15 fps.
-- Collected by `phase4_collect_demos.py` (IK-scripted expert), written by `lerobot_writer.py`.
+- Collected by `droid/phase4_collect_demos.py` (IK-scripted expert), written by `droid/lerobot_writer.py`.
 - Converted v2.1 → v3.0 on the Modal volume (`molmoact2-lerobot-data`) before training.
 - Cameras: `observation.images.external_cam`, `observation.images.wrist_cam`.
 - State/action: 8-D `[q1..q7, gripper_rad]`, `norm_mode=min_max` (writer emits
@@ -32,7 +32,7 @@ Action-expert-only fine-tune of MolmoAct2-DROID on the green-ball pick-and-place
 
 ## Launch command
 ```bash
-modal run phase4_modal_train.py::main --mode ae_only --max-steps 500 \
+modal run droid/phase4_modal_train.py::main --mode ae_only --max-steps 500 \
     --save-interval 250 --global-batch-size 8 --device-batch-size 1 --exp-name ae_train
 ```
 
@@ -87,10 +87,10 @@ above (fast + per-step logs).
 
 ## Serving this checkpoint
 The DCP format above is a **training** checkpoint. The base Phase 3 server
-(`phase3_modal.py`) loads the released Hugging Face checkpoint through
+(`droid/phase3_modal.py`) loads the released Hugging Face checkpoint through
 `host_server_droid.py`, so it is still the right server for `allenai/MolmoAct2-DROID`.
 
-For this fine-tuned checkpoint, use the new `phase3_modal_finetuned.py` wrapper. It is
+For this fine-tuned checkpoint, use the new `droid/phase3_modal_finetuned.py` wrapper. It is
 intended to load the raw DCP checkpoint directly from the Modal checkpoint volume using
 `molmoact2/experiments/scripts/serve_policy.py`, with:
 - checkpoint: `/checkpoints/checkpoints/finetune/ae_train/step500`
@@ -99,16 +99,16 @@ intended to load the raw DCP checkpoint directly from the Modal checkpoint volum
 - action mode: `continuous`
 
 Current status:
-- `phase3_modal_finetuned.py` has been added.
+- `droid/phase3_modal_finetuned.py` has been added.
 - It has not yet been deployed.
 - `/health` has not yet been checked.
-- `phase3_closed_loop.py` has not yet been run against the fine-tuned endpoint.
+- `droid/phase3_closed_loop.py` has not yet been run against the fine-tuned endpoint.
 - No training, download, or simulation process is currently running.
 
 Next commands:
 ```bash
-modal deploy phase3_modal_finetuned.py
-uv run python phase3_closed_loop.py --model-path droid \
+modal deploy droid/phase3_modal_finetuned.py
+uv run python droid/phase3_closed_loop.py --model-path droid \
     --server-url <printed-finetuned-modal-url>/act \
     --request-timeout 600 --chunks 5
 ```

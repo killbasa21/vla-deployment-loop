@@ -285,7 +285,7 @@ uv run python libero/libero_closed_loop.py \
     --chunks 25 --no-view --run-id act_ck60000_00
 
 # P4
-uv run python libero/score_runs.py assets/logs/act_*.jsonl
+uv run python libero/score_runs.py assets/act/act-green-ball_010000
 ```
 
 `--payload-keys libero` is required (sends `{image, wrist_image, instruction, state}`); the

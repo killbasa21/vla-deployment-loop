@@ -1,16 +1,42 @@
 [project]
 name = "greenbox"
 version = "0.1.0"
-description = "Add your description here"
+description = "Closed-loop VLA pick-and-place on a simulated Franka Panda: MuJoCo locally, policy server on Modal"
 readme = "README.md"
 requires-python = ">=3.12"
+
+# LOCAL dependencies only -- the simulator, the closed-loop client, the dataset writers and
+# the scorers. This env never runs a model.
+#
+# torch, lerobot, transformers and friends are deliberately ABSENT. They belong to the Modal
+# images in infra/modal_images.py, which are built remotely; installing them here would add
+# multiple GB to a venv with no GPU to use them on. See README.md, "Package management".
 dependencies = [
+    "glfw>=2.10",          # droid/phase1_playground.py's interactive viewer. Arrives
+                           # transitively via mujoco, but is imported directly, so it is
+                           # declared directly.
     "imageio[ffmpeg]>=2.37.3",
-    "json-numpy>=2.1.1",
-    "modal>=0.68",
+    "json-numpy>=2.1.1",   # the /act wire encoding, client side
+    "modal>=0.68",         # deploy/serve only; the images themselves are built remotely
     "mujoco>=3.10.0",
-    "pandas>=3.0.5",
+    "pandas>=3.0.5",       # dataset stats + parquet inspection
     "pillow>=12.3.0",
-    "pyarrow>=25.0.0",
+    "pyarrow>=25.0.0",     # LeRobot parquet writers
     "requests>=2.34.2",
 ]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14",
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["molmoact2", "mujoco_menagerie", ".venv", "assets", "data", "fine_tunes"]
+
+# Real errors and undefined names only. This is research code with deliberate
+# non-idioms in it -- bare `except` around a /health probe that must never be fatal,
+# long-lived log file handles held open outside a `with` so a run can be tailed live --
+# and a linter that flags those trains you to stop reading its output.
+[tool.ruff.lint]
+select = ["E", "F", "W"]

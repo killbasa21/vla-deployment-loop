@@ -1,11 +1,11 @@
 """Fine-tune `allenai/MolmoAct2-LIBERO` on our green-ball demos, on a rented Modal GPU.
 
-Sibling of the repo root's `phase4_modal_train.py` (which fine-tunes the DROID checkpoint
+Sibling of the repo root's `droid/phase4_modal_train.py` (which fine-tunes the DROID checkpoint
 on the DROID-convention dataset) and of `libero/libero_modal.py` (which serves the stock
 LIBERO checkpoint). Kept separate for the same reason those two are: the DROID path is
 working and nothing here should be able to break it.
 
-Three things differ from `phase4_modal_train.py`, and only three:
+Three things differ from `droid/phase4_modal_train.py`, and only three:
 
   1. START_CHECKPOINT   -> "allenai/MolmoAct2-LIBERO"
   2. DEFAULT_MIXTURE    -> "libero_green_ball" (registered by us in data_mixtures.py under
@@ -74,37 +74,27 @@ what this repo's lerobot fork requires.
     modal volume get molmoact2-checkpoints checkpoints/finetune/<exp_name> ./out
 """
 
+import sys
+from pathlib import Path
+
 import modal
 
-# Same image recipe as phase4_modal_train.py -- the training package pins
+# The shared image definitions live at the repo root, and Modal re-imports this
+# module inside the container -- where infra/ lands on /root via with_infra().
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.modal_images import molmoact_experiments_image, with_infra
+
+# Same image recipe as droid/phase4_modal_train.py -- the training package pins
 # transformers>=5.3, a different pin from the inference server's 4.57, so this cannot
 # share phase3/libero_modal's image.
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "ffmpeg")
-    .pip_install(
-        "torch==2.5.1", "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "HF_HOME": "/cache/huggingface",
+image = with_infra(
+    molmoact_experiments_image({
         "LEROBOT_DATA_ROOT": "/data",
         "LEROBOT_VIDEO_BACKEND": "pyav",
-        "TOKENIZERS_PARALLELISM": "false",
         "WANDB_MODE": "disabled",
         "WANDB_PROJECT": "greenbox-libero-green-ball",
         "WANDB_ENTITY": "greenbox",
     })
-    .pip_install("hf-transfer>=0.1.8")
-    .add_local_dir("molmoact2/experiments", remote_path="/root/experiments", copy=True)
-    .run_commands(
-        "cd /root/experiments && pip install -e '.[all]'",
-        # [async] only. The [libero] extra pulls hf-libero -> robosuite -> egl_probe, which
-        # needs cmake + OpenGL headers and is only for LIBERO *simulator* eval; training on
-        # a LeRobot dataset imports none of it.
-        "cd /root/experiments && pip install -e './lerobot[async]'",
-    )
     .pip_install("debugpy")  # train_lerobot.py imports it unconditionally
 )
 

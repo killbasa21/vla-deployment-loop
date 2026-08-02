@@ -1,7 +1,7 @@
 # FINE_TUNE_LEARNINGS
 
 Live log of the MolmoAct2-LIBERO fine-tune for the green-ball pick-and-place task.
-Started 2026-07-28, from the handoff in `NEXT_STEPS_FOR_FINE_TUNE.md`.
+Started 2026-07-28, from the handoff in `docs/NEXT_STEPS_FOR_FINE_TUNE.md`.
 
 Companion docs: `README.md` (servo droop, the dataset scoreboard, the measured stock-
 checkpoint baseline), `libero/README.md` (conventions/scene/control law),
@@ -166,7 +166,7 @@ log (`count` 273465 = pinned, ~19000 = not).
 |---|---|
 | `molmoact2/experiments/launch_scripts/data_mixtures.py` | new `libero_green_ball` mixture, tag **`libero`** |
 | `libero/fine_tune/pin_released_stats.py` | pins released normalisation into a dataset |
-| `libero/libero_modal_train.py` | Modal training wrapper (counterpart to `phase4_modal_train.py`) |
+| `libero/libero_modal_train.py` | Modal training wrapper (counterpart to `droid/phase4_modal_train.py`) |
 | `libero/libero_modal_finetuned.py` | Modal serving wrapper for the result |
 | `libero/libero_closed_loop.py` | new `--payload-keys` (see §5.3) |
 
@@ -252,7 +252,7 @@ Smoke-run findings worth keeping:
 
 - The merged directory is `stepN-merged` (the log line says "step1-lora-merged", which is a
   message, not the path). That is the one the serving wrapper must load — see
-  `libero_modal_finetuned.py`, and `phase3_modal_finetuned.py` for why a raw `stepN` LoRA
+  `libero_modal_finetuned.py`, and `droid/phase3_modal_finetuned.py` for why a raw `stepN` LoRA
   checkpoint cannot be served.
 - `save_merged_lora_checkpoint` costs **150 s per save**, more than the base checkpoint
   write. At $3.95/hr each extra checkpoint is ~$0.22, which is 4% of this budget — that is

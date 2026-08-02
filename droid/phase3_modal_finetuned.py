@@ -1,15 +1,15 @@
 """
 Phase 3 (fine-tuned Modal variant): serve OUR Phase 4 fine-tuned MolmoAct2 checkpoint.
 
-WHY THIS FILE EXISTS (and how it differs from phase3_modal.py)
+WHY THIS FILE EXISTS (and how it differs from droid/phase3_modal.py)
 -------------------------------------------------------------
-`phase3_modal.py` serves the *released* checkpoint `allenai/MolmoAct2-DROID`. That
+`droid/phase3_modal.py` serves the *released* checkpoint `allenai/MolmoAct2-DROID`. That
 checkpoint ships in Hugging Face format (a `config.json` + `*.safetensors` weights +
 processor files), and the DROID example server (`host_server_droid.py`) loads it with
 the normal `transformers`/`AutoModel` machinery.
 
 Our Phase 4 fine-tune produced a DIFFERENT on-disk format. The training code
-(`molmoact2/experiments`, run by `phase4_modal_train.py`) is built on Ai2's "OLMo"
+(`molmoact2/experiments`, run by `droid/phase4_modal_train.py`) is built on Ai2's "OLMo"
 training stack, which saves a **PyTorch Distributed Checkpoint (DCP)**:
 
     step500/
@@ -23,11 +23,11 @@ That is a *training* checkpoint, not an HF model, so `transformers` can't load i
 `host_server_droid.py` won't work. Instead we load it through the experiments repo's own
 LeRobot policy wrapper, exposed by `molmoact2/experiments/scripts/serve_policy.py` as a
 class `MolmoAct2Server` that builds a FastAPI app speaking the SAME `/act` wire protocol.
-So the local sim client (`phase3_closed_loop.py`) doesn't need to change on the request
+So the local sim client (`droid/phase3_closed_loop.py`) doesn't need to change on the request
 side -- it POSTs the same `{external_cam, wrist_cam, instruction, state}` payload.
 
 (One wire difference on the RESPONSE side: this server reports timing as `latency_ms`,
-while `host_server_droid.py` uses `dt_ms`. If `phase3_closed_loop.py` reads `dt_ms`
+while `host_server_droid.py` uses `dt_ms`. If `droid/phase3_closed_loop.py` reads `dt_ms`
 strictly it needs a small tolerance -- `body.get("dt_ms") or body.get("latency_ms")`.)
 
 MODAL MENTAL MODEL (serverless GPU)
@@ -42,11 +42,11 @@ GPU, and exposes the FastAPI app to the internet. Key ideas used here:
     the 25 GB checkpoint lives, so we never re-upload it.
 
 Usage:
-    modal serve phase3_modal_finetuned.py    # ephemeral dev server, live-reloads on save
-    modal deploy phase3_modal_finetuned.py   # persistent deployment, prints a stable URL
+    modal serve droid/phase3_modal_finetuned.py    # ephemeral dev server, live-reloads on save
+    modal deploy droid/phase3_modal_finetuned.py   # persistent deployment, prints a stable URL
 
 Then point the local sim at the printed URL + "/act":
-    uv run python phase3_closed_loop.py --model-path droid \
+    uv run python droid/phase3_closed_loop.py --model-path droid \
         --server-url https://<workspace>--molmoact2-droid-finetuned-molmoactfinetunedserver-serve.modal.run/act \
         --request-timeout 600 --chunks 5
 (The `--request-timeout 600` matters: the very first request after a cold start pays for
@@ -57,7 +57,7 @@ import modal
 
 # WHERE the checkpoint lives INSIDE the container. This is not a local path on your
 # laptop -- it's a path on the `molmoact2-checkpoints` Modal Volume, mounted at
-# "/checkpoints" by the @app.cls below. `phase4_modal_train.py` wrote this fine-tune as
+# "/checkpoints" by the @app.cls below. `droid/phase4_modal_train.py` wrote this fine-tune as
 # .../finetune/lora_train/ -- the LoRA run (VLM adapters + full action expert) on the
 # bin-randomized `lora_adapter` dataset, meant to fix ae_train's failure to visually locate
 # the target (see data/lora_adapter/README.md).
@@ -84,7 +84,7 @@ CHECKPOINT_PATH = "/checkpoints/checkpoints/finetune/lora_train/step500-merged"
 NORM_TAG = "lora_adapter"
 
 # --- Image ------------------------------------------------------------------
-# The container blueprint. This mirrors phase4_modal_train.py's image because SERVING
+# The container blueprint. This mirrors droid/phase4_modal_train.py's image because SERVING
 # the DCP checkpoint needs the exact same code + deps that TRAINED it (the experiments
 # package + its lerobot fork know how to reconstruct the model from the shards). Notes:
 #   - Python 3.12: the vendored lerobot fork requires >=3.12.
@@ -94,10 +94,10 @@ NORM_TAG = "lora_adapter"
 #   - `lerobot[async]` only -- we deliberately skip the `[libero]` extra the README uses,
 #     because it drags in a simulator stack (robosuite -> egl_probe) that needs cmake and
 #     is only for LIBERO benchmark eval, which we don't run.
-# Caching caveat: because this `.env(...)` differs from phase4_modal_train.py's, the heavy
+# Caching caveat: because this `.env(...)` differs from droid/phase4_modal_train.py's, the heavy
 # pip layers below are NOT shared with that already-built image -- the FIRST deploy of
 # this file rebuilds them (~15-25 min). (To make deploys instant you could instead import
-# and reuse phase4_modal_train.py's `image` object, at the cost of coupling the files.)
+# and reuse droid/phase4_modal_train.py's `image` object, at the cost of coupling the files.)
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("git", "ffmpeg")
@@ -125,10 +125,10 @@ image = (
 )
 
 # --- Volumes (persistent network storage) -----------------------------------
-# `hf_cache`: shared with phase3_modal.py / phase4_modal_train.py so any Hugging Face
+# `hf_cache`: shared with droid/phase3_modal.py / droid/phase4_modal_train.py so any Hugging Face
 # downloads (e.g. the base tokenizer/processor the checkpoint references) are cached once.
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)
-# `checkpoints`: where phase4_modal_train.py saved the fine-tune. We mount it read/serve
+# `checkpoints`: where droid/phase4_modal_train.py saved the fine-tune. We mount it read/serve
 # and load CHECKPOINT_PATH from it -- no 25 GB re-upload per deploy.
 checkpoints = modal.Volume.from_name("molmoact2-checkpoints", create_if_missing=True)
 
@@ -139,7 +139,7 @@ app = modal.App("molmoact2-droid-finetuned")
     image=image,
     # A100-40GB is plenty for 4B-param INFERENCE (weights ~8-16 GB + activations); the
     # 25 GB on disk includes optimizer shards we don't load for serving. The base server
-    # (phase3_modal.py) uses the same GPU for the same model.
+    # (droid/phase3_modal.py) uses the same GPU for the same model.
     gpu="A100-40GB",
     volumes={
         "/cache/huggingface": hf_cache,
@@ -176,7 +176,7 @@ class MolmoActFinetunedServer:
             device="cuda:0",
             # Preset naming the two camera keys this embodiment expects, in order:
             # "droid" -> ["external_cam", "wrist_cam"], matching our dataset and exactly
-            # the keys phase3_closed_loop.py sends.
+            # the keys droid/phase3_closed_loop.py sends.
             image_keys="droid",
             # MolmoAct2 can emit actions as a continuous flow-matching trajectory or as
             # discrete tokens. Our checkpoint's action expert is continuous (the released
@@ -203,7 +203,7 @@ class MolmoActFinetunedServer:
 
 @app.local_entrypoint()
 def smoke_test():
-    """`modal run phase3_modal_finetuned.py` -- spin the app up ephemerally and hit
+    """`modal run droid/phase3_modal_finetuned.py` -- spin the app up ephemerally and hit
     /health to confirm the model loaded and the endpoint answers, without touching the
     sim. For a persistent deployment use `modal deploy` instead; it prints the same base
     URL. The `/act` endpoint the sim client needs is that base URL + "/act"."""

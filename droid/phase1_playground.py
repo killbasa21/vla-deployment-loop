@@ -32,7 +32,7 @@ data = mujoco.MjData(model)
 home_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
 mujoco.mj_resetDataKeyframe(model, data, home_id)
 
-# Same fix as phase1_render_check.py: the "home" keyframe predates these bodies, so its
+# Same fix as droid/phase1_render_check.py: the "home" keyframe predates these bodies, so its
 # qpos got zero-padded for all of them. Reset each one to the position we actually want
 # to start from (matching scene_pick_place.xml), the same way we did for red_box there.
 INITIAL_POSITIONS = {

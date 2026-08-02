@@ -10,7 +10,7 @@ Checks, in order of what they would catch:
      only shows up as instability once it rotates, so it is checked explicitly.
   2. STATION KEEPING / DROOP. The headline claim for this port: a torque controller with
      gravity compensation has no standing sag, unlike the position servo whose droop is
-     the subject of the whole top-level README.md. Measured against that file's numbers.
+     the subject of the whole `docs/SERVO_DROOP.md`. Measured against that file's numbers.
   3. STEP RESPONSE. How much of a commanded delta is realised in one 20 Hz tick. README
      sec.3 measures the position servo at ~33% (stock gains). PROGRESS sec.12 predicts OSC
      also under-travels, since kp=150 critically damped cannot traverse a full delta in
@@ -118,7 +118,7 @@ def check_station_keeping():
           f"(norm {np.linalg.norm(sag) * 1000:.3f} mm)")
     print(f"  height above table        {settled[2] - TABLE_TOP_Z:.4f} m "
           f"(LIBERO measured 0.2733)")
-    print("  README.md sec.1: position servo sag was 4.84 mm stock, 2.44 mm stiffened")
+    print("  docs/SERVO_DROOP.md sec.1: position servo sag was 4.84 mm stock, 2.44 mm stiffened")
     ok = np.linalg.norm(sag) < 5e-4
     print(f"  -> {'PASS' if ok else 'FAIL'} (want < 0.5 mm)")
     return ok
@@ -148,7 +148,7 @@ def check_step_response():
     predicted = 1.0 - (1.0 + wn * t) * np.exp(-wn * t)
     print(f"  ANALYTIC: wn=sqrt(kp)={wn:.3f} rad/s, critically damped, t={t:.3f} s")
     print(f"            1-(1+wn*t)*exp(-wn*t) = {predicted * 100:.1f}%  <- expected")
-    print("  README.md sec.3: position servo realises ~33% (stock) / ~72% (stiffened),")
+    print("  docs/SERVO_DROOP.md sec.3: position servo realises ~33% (stock) / ~72% (stiffened),")
     print("  so OSC moves LESS per tick than Route A did. That is not a regression: the")
     print("  policy was TRAINED through this exact response, so its commanded magnitudes")
     print("  already account for it. A value near 100% would mean the port is WRONG.")

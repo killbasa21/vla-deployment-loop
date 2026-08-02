@@ -13,7 +13,7 @@ Also confirm from that same client code: the exact `json_numpy`-encoded request 
 ## Step-by-step
 
 **1. Observation capture function**
-- Render `external_cam` and `wrist_cam` via `mujoco.Renderer` (same pattern as `phase1_render_check.py`), returning two `(H, W, 3)` uint8 arrays.
+- Render `external_cam` and `wrist_cam` via `mujoco.Renderer` (same pattern as `droid/phase1_render_check.py`), returning two `(H, W, 3)` uint8 arrays.
 - Read proprioception: `data.qpos[0:7]` for the 7 arm joint angles, plus the gripper's current opening — pull this from `data.ctrl[7]` (our own last commanded gripper target) or from the finger joints' actual `qpos`, converted into whatever units Phase 3's step 0 determined MolmoAct2 expects.
 
 **2. Client request/response**
@@ -31,7 +31,7 @@ Also confirm from that same client code: the exact `json_numpy`-encoded request 
 
 ## Key files
 - `mujoco_menagerie/franka_emika_panda/scene_pick_place.xml` — the scene (already built)
-- `phase1_render_check.py` — reference pattern for offscreen rendering + the keyframe-padding fix for freejoint bodies (same fix will be needed here since we're reading/writing `data.qpos` directly again)
+- `droid/phase1_render_check.py` — reference pattern for offscreen rendering + the keyframe-padding fix for freejoint bodies (same fix will be needed here since we're reading/writing `data.qpos` directly again)
 - MolmoAct2 repo's `examples/droid/` client code — reference for exact request schema and unit conventions (read before writing our own client, per the "resolve the units question" section above)
 
 ## Verification

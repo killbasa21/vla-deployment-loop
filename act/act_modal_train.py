@@ -49,7 +49,15 @@ exits with "Specify a Modal Function or local entrypoint". And give the SMOKE it
 default name blocks the real run behind a --overwrite it should not need.
 """
 
+import sys
+from pathlib import Path
+
 import modal
+
+# The shared image definitions live at the repo root, and Modal re-imports this
+# module inside the container -- where infra/ lands on /root via with_infra().
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.modal_images import lerobot_train_image, with_infra
 
 # a7: 60 episodes, 20034 frames, 334 ticks/ep, --delta-pos-scale 0.10, shuffled bins.
 #
@@ -69,22 +77,7 @@ REMOTE_REPO = "/data/greenbox/green_ball_a7_act"   # its own path -- an overwrit
 # than a 15-25 minute rebuild. `[smolvla]` is NOT needed for ACT, but dropping it here would
 # fork the image chain and cost that time back on the very first run; it is a few hundred MB
 # of already-cached wheels.
-image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install("git", "ffmpeg")
-    .pip_install(
-        "torch==2.5.1", "torchvision==0.20.1",
-        extra_index_url="https://download.pytorch.org/whl/cu121",
-    )
-    .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "HF_HOME": "/cache/huggingface",
-        "TOKENIZERS_PARALLELISM": "false",
-    })
-    .pip_install("hf-transfer>=0.1.8")
-    .pip_install("lerobot[smolvla,dataset]", "peft", "fastapi[standard]", "json-numpy",
-                 "pillow")
-)
+image = with_infra(lerobot_train_image())
 
 hf_cache = modal.Volume.from_name("molmoact2-hf-cache", create_if_missing=True)
 lerobot_data = modal.Volume.from_name("molmoact2-lerobot-data", create_if_missing=True)

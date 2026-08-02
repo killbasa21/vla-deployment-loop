@@ -4,8 +4,8 @@ instead of a manually rented GPU box.
 
 This does not reimplement the server -- it wraps the existing FastAPI app from
 molmoact2/examples/droid/host_server_droid.py (Policy + build_app) inside a
-Modal container so the wire protocol phase3_closed_loop.py already speaks
-(json_numpy POST to /act) is unchanged. Only SERVER_URL in phase3_closed_loop.py
+Modal container so the wire protocol droid/phase3_closed_loop.py already speaks
+(json_numpy POST to /act) is unchanged. Only SERVER_URL in droid/phase3_closed_loop.py
 needs to change, to whatever URL `modal deploy` prints.
 
 Checkpoint weights are cached on a Modal Volume mounted at the HF cache path,
@@ -15,10 +15,10 @@ Modal's network storage instead of re-downloading from the Hub.
 
 Usage:
     modal setup                        # one-time auth (opens a browser)
-    modal serve phase3_modal.py        # ephemeral dev server, live-reloads on save
-    modal deploy phase3_modal.py       # persistent deployment, prints the URL
+    modal serve droid/phase3_modal.py        # ephemeral dev server, live-reloads on save
+    modal deploy droid/phase3_modal.py       # persistent deployment, prints the URL
 
-Then point phase3_closed_loop.py's SERVER_URL (or its --server-url flag) at the
+Then point droid/phase3_closed_loop.py's SERVER_URL (or its --server-url flag) at the
 printed URL + "/act". The slug is longer than you'd guess from the class name
 alone -- Modal includes both the app name and the @app.cls name in it, so it's
 https://<workspace>--molmoact2-droid-molmoactdroidserver-serve.modal.run/act,
@@ -111,7 +111,7 @@ class MolmoActDroidServer:
 
 @app.local_entrypoint()
 def smoke_test():
-    """`modal run phase3_modal.py` -- spins up the app ephemerally, prints its
+    """`modal run droid/phase3_modal.py` -- spins up the app ephemerally, prints its
     URL, and hits /healthz. For a persistent deployment use `modal deploy`
     instead; it prints the same URL, which stays stable across redeploys."""
     import urllib.request

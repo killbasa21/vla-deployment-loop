@@ -13,21 +13,21 @@ Work in /home/hardik/Desktop/greenbox. Goal: fine-tune allenai/MolmoAct2-LIBERO 
 simulated Franka Panda picks up a green ball and places it in the green container.
 
 STEP 1 — READ FIRST, IN THIS ORDER
-- README.md (top level). This is the current state of the world. It documents a servo
+- `docs/SERVO_DROOP.md` (was the top-level README until the 2026-08-02 reorg). At the time of writing this was the current state of the world. It documents a servo
   droop bug that poisoned the first two training datasets, the fix, and a measured
   closed-loop evaluation showing the stock checkpoint still fails the task.
 - libero/README.md (conventions/spec), libero/fine_tune/README.md (dataset format),
   libero/PROGRESS.md (attempt log).
 IMPORTANT: PROGRESS.md deliberately keeps wrong turns in, and several of its conclusions
-were later reversed. README.md §1.1, §5.1, §6.5 and §9 list numbers in the other docs that
-are known stale or wrong. Where docs disagree, README.md wins. Re-measure anything load
+were later reversed. docs/SERVO_DROOP.md §1.1, §5.1, §6.5 and §9 list numbers in the other docs that
+are known stale or wrong. Where docs disagree, docs/SERVO_DROOP.md wins. Re-measure anything load
 bearing rather than trusting a quoted figure.
 
 STEP 2 — FIX THE DATA
 Current dataset is libero/fine_tune/a3 (30 episodes: 10 reach / 10 noise / 10 recover,
 5220 frames). a1/ and a2/ are SUPERSEDED — collected on the old plant, do not train on
 them. a3's format is validated correct against the released dataset; the format is not the
-problem. Two substantive problems remain, both described in README.md §6, §6.5, §6.6:
+problem. Two substantive problems remain, both described in docs/SERVO_DROOP.md §6, §6.5, §6.6:
 
 (a) The dx action channel is one-sided: q01 = -0.072 against the released dataset's
     -0.679. Over the whole dataset there is essentially no signal for retreating in -x,
@@ -49,7 +49,7 @@ per-channel quantiles against released, and LOOK AT the decoded PNG frames — t
 has been burned twice by concluding orientation from numbers alone.
 
 STEP 3 — FINE-TUNE
-No LIBERO training wrapper exists yet. phase4_modal_train.py is the DROID/phase-4
+No LIBERO training wrapper exists yet. droid/phase4_modal_train.py is the DROID/phase-4
 counterpart and targets the 'green_ball_pick' mixture — use it as the structural template
 but you will need a new mixture entry in data_mixtures.py (copy build_molmoact2_libero,
 point it at our repo id), a volume upload, and a serving wrapper for the result.

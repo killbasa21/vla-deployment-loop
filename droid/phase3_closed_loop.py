@@ -8,13 +8,13 @@ Every outer iteration:
   3. POST {images, instruction, state} to the remote /act endpoint (direct external port,
      no SSH tunnel) -> get back an action chunk, shape (N, 8).
   4. Apply each of the N actions in turn: set data.ctrl, step physics for `decimation`
-     steps (one 15 Hz control tick, matching how phase4_collect_demos.py recorded the
+     steps (one 15 Hz control tick, matching how droid/phase4_collect_demos.py recorded the
      training data -- see CONTROL_HZ below), then re-render and save both camera frames
      so the episode can be inspected afterward.
 
 Usage:
-    uv run python phase3_closed_loop.py --dry-run          # just check the server round trip
-    uv run python phase3_closed_loop.py --chunks 5          # actually run the sim, 5 chunks
+    uv run python droid/phase3_closed_loop.py --dry-run          # just check the server round trip
+    uv run python droid/phase3_closed_loop.py --chunks 5          # actually run the sim, 5 chunks
 """
 
 import argparse
@@ -76,7 +76,7 @@ GRIPPER_CTRL_MAX = 255.0
 # so this number is a real physical constant now, not a guess.
 ROBOTIQ_KNUCKLE_CLOSED_MAX = 0.8  # radians; 0 = open, 0.8 = closed
 
-# MolmoAct2-DROID emits actions at 15 Hz, and phase4_collect_demos.py recorded the
+# MolmoAct2-DROID emits actions at 15 Hz, and droid/phase4_collect_demos.py recorded the
 # training demos at that rate too (its own CONTROL_HZ) -- so one action must be held for
 # 1/15 s of simulated time, not for a single mj_step. The scene's timestep is 0.002 s,
 # so that's decimation = round(500/15) = 33 steps per action.
@@ -195,7 +195,7 @@ def capture_and_submit(executor, renderer, data, model, tracked_body_id, server_
 
 
 # Every scene's graspable props are freejoint bodies whose world pose lives in qpos -- but the
-# "home" keyframe in each scene's XML predates them (see phase1_render_check.py's original
+# "home" keyframe in each scene's XML predates them (see droid/phase1_render_check.py's original
 # comment on red_box), so mj_resetDataKeyframe zero-pads their qpos to the origin instead of
 # their intended resting pose. Same fix, generalized across scenes: look up whichever of these
 # bodies the loaded model actually has (scene_pick_place.xml has red_box; scene_droid.xml has
@@ -203,7 +203,7 @@ def capture_and_submit(executor, renderer, data, model, tracked_body_id, server_
 # scene's own XML comments for why these numbers -- EXCEPT red_box, see below.
 FREE_BODY_INITIAL_POSES = {
     # NOT the XML's own default body pos ("0.5 0 0.02", that was phase3's original red-box-task
-    # spot). This is where phase4_collect_demos.py's reset_scene() actually parks red_box as a
+    # spot). This is where droid/phase4_collect_demos.py's reset_scene() actually parks red_box as a
     # static distractor on every single training episode -- match that exactly, since that's the
     # position the green_ball_pick fine-tune's images actually show it at.
     "red_box": ((0.5, -0.28, 0.02), (1, 0, 0, 0)),
@@ -212,7 +212,7 @@ FREE_BODY_INITIAL_POSES = {
     "tennis_ball": ((0.45, -0.20, 0.433), (1, 0, 0, 0)),
 }
 
-# green_ball's training-time xy distribution -- phase4_collect_demos.py's sample_ball_xy().
+# green_ball's training-time xy distribution -- droid/phase4_collect_demos.py's sample_ball_xy().
 # --randomize-ball draws from this same range so the sim replicates the training distribution
 # instead of always using FREE_BODY_INITIAL_POSES' single fixed spot.
 GREEN_BALL_XY_RANGE = ((0.40, 0.58), (-0.16, 0.14))
@@ -225,7 +225,8 @@ RED_BOX_HIDDEN_POSE = ((5.0, 5.0, -5.0), (1, 0, 0, 0))
 
 # The lora_train fine-tune (data/lora_adapter/) additionally randomizes which of the 3 bins
 # (green/blue/yellow) sits at which of these 3 anchor slots, per episode -- see
-# phase4_collect_demos.py's randomize_bin_layout(). scene_pick_place.xml's own default body_pos
+# droid/phase4_collect_demos.py's randomize_bin_layout(). scene_pick_place.xml's own
+# default body_pos
 # for these three bodies is exactly this identity assignment (green->slot0, blue->slot1,
 # yellow->slot2, zero jitter) -- i.e. ONE single point in the training distribution. Evaluating
 # the LoRA checkpoint without also randomizing bins would only ever test that one layout, not
@@ -238,7 +239,7 @@ BIN_NAMES = ("green_bin", "blue_bin", "yellow_bin")
 # Which of FREE_BODY_INITIAL_POSES' bodies (in priority order) gets its pose logged/returned as
 # this run's single "tracked object" -- mirrors the old red_box-only tracking, just extended to
 # pick the first match present in whichever scene got loaded rather than hardcoding red_box.
-# green_ball first: it's the actual Phase 4 fine-tune target (see phase4_collect_demos.py),
+# green_ball first: it's the actual Phase 4 fine-tune target (see droid/phase4_collect_demos.py),
 # scene_pick_place.xml has both it and red_box (a distractor there), so it must outrank red_box.
 TRACKED_OBJECT_CANDIDATES = ["green_ball", "red_box", "lego_duplo"]
 
@@ -314,14 +315,28 @@ def main():
     parser.add_argument(
         "--assets-dir",
         default="assets",
-        help="root dir for per-run debug artifacts: <assets-dir>/logs/<run-id>.jsonl "
-             "and <assets-dir>/images/<run-id>/ (see CLAUDE.md)",
+        help="root dir for per-run debug artifacts: "
+             "<assets-dir>/<model>/<fine-tune>/logs/<run-id>.jsonl and "
+             ".../images/<run-id>/ (see CLAUDE.md)",
     )
     parser.add_argument(
         "--run-id",
         default=None,
         help="identifier for this run's logs/images subtree (default: timestamp_pid, "
              "so concurrent runs never collide)",
+    )
+    parser.add_argument(
+        "--model",
+        default="molmoact2-droid",
+        help="policy family -- first level of the artifact tree, "
+             "<assets-dir>/<model>/<fine-tune>/. This track only ever served MolmoAct2-DROID, "
+             "so unlike libero_closed_loop.py it does not probe /health for it.",
+    )
+    parser.add_argument(
+        "--fine-tune",
+        default="stock",
+        help="which checkpoint of that family -- second level of the artifact tree "
+             "(e.g. 'stock', 'ae_train_step500').",
     )
     parser.add_argument(
         "--no-view",
@@ -342,7 +357,8 @@ def main():
         default=SERVER_URL,
         help=(
             "override the /act endpoint (default: the vast.ai instance in SERVER_URL above). "
-            "Point this at a Modal deployment's URL (see phase3_modal.py) to run against that instead."
+            "Point this at a Modal deployment's URL (see droid/phase3_modal.py) to "
+            "run against that instead."
         ),
     )
     parser.add_argument(
@@ -385,7 +401,7 @@ def main():
         action="store_true",
         help=(
             "place green_ball at a random xy drawn from the same range "
-            "phase4_collect_demos.py's sample_ball_xy() used for training "
+            "droid/phase4_collect_demos.py's sample_ball_xy() used for training "
             f"({GREEN_BALL_XY_RANGE}), instead of its single fixed default spot"
         ),
     )
@@ -402,7 +418,8 @@ def main():
         action="store_true",
         help=(
             "shuffle green/blue/yellow bin positions across the same 3 anchor slots (with "
-            "jitter) phase4_collect_demos.py's randomize_bin_layout() used for the lora_train "
+            "jitter) droid/phase4_collect_demos.py's randomize_bin_layout() used for "
+            "the lora_train "
             "fine-tune, instead of scene_pick_place.xml's single fixed default layout"
         ),
     )
@@ -433,7 +450,7 @@ def main():
         help=(
             "physics steps to hold each action for (one control tick). Default: derived "
             f"from the scene timestep and {CONTROL_HZ:g} Hz, = 33 for a 0.002 s timestep, "
-            "matching phase4_collect_demos.py. Override only to ablate the effect of the "
+            "matching droid/phase4_collect_demos.py. Override only to ablate the effect of the "
             "control rate -- a value below the default is what the pre-fix code did "
             "implicitly (=1) and it stalls the arm"
         ),
@@ -481,15 +498,18 @@ def main():
     # concurrent/successive runs never clobber each other's logs or frames and the two
     # can be cross-referenced by run_id while a run is still in progress.
     run_id = args.run_id or f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    assets_dir = Path(args.assets_dir)
-    log_dir = assets_dir / "logs"
-    images_dir = assets_dir / "images" / run_id
+    # Grouped by policy first: <assets>/<model>/<fine-tune>/. Same layout as
+    # libero_closed_loop.py, so one scorer reads both trees.
+    run_root = Path(args.assets_dir) / args.model / args.fine_tune
+    log_dir = run_root / "logs"
+    images_dir = run_root / "images" / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
     if not args.dry_run:
         images_dir.mkdir(parents=True, exist_ok=True)
 
     log_path = log_dir / f"{run_id}.jsonl"
     print(f"run_id: {run_id}")
+    print(f"  policy: {args.model}/{args.fine_tune}")
     print(f"  log:    {log_path}")
     print(f"  images: {images_dir}/" if not args.dry_run else "  images: (skipped, --dry-run)")
     log_f = open(log_path, "w")
@@ -677,7 +697,7 @@ def main():
                 # inner loop (rather than once after it) keeps the on-screen motion smooth
                 # at physics rate instead of stepping 66 ms at a time; rendering/saving
                 # still happens once per action, so the saved frames stay at the same
-                # 15 Hz cadence phase4_collect_demos.py recorded observations at.
+                # 15 Hz cadence droid/phase4_collect_demos.py recorded observations at.
                 for _ in range(decimation):
                     mujoco.mj_step(model, data)
                     viewer.sync()

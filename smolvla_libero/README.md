@@ -35,7 +35,7 @@ applies here unchanged, and SmolVLA adds three things MolmoAct2 did not:
 | fine-tune | LoRA r32, ~$5/run, 200 s per checkpoint save | full fine-tune fits on one mid card |
 | published LIBERO | — | 90 / 96 / 92 / 71, avg **87.3%** |
 
-The size is the point. `FINE_TUNE_LEARNINGS.md` §5.5 records the binding constraint on the
+The size is the point. `docs/FINE_TUNE_LEARNINGS.md` §5.5 records the binding constraint on the
 MolmoAct2 path: a $5 budget bought **150 steps = 0.06 epochs**, at which point the honest read
 was that the checkpoint had "barely moved off the base". A 12x smaller model turns the same
 budget into a real training run.
@@ -189,7 +189,7 @@ One rollout is one draw — SmolVLA's action expert is flow-matching, it **sampl
 completely). Run several, then:
 
 ```bash
-uv run python libero/score_runs.py assets/logs/smolvla_stock_*.jsonl
+uv run python libero/score_runs.py assets/smolvla_libero/stock
 ```
 
 `score_runs.py` works unchanged — this server emits the same log schema, because the client
