@@ -1447,6 +1447,77 @@ inversely with the action scale, so a lower scale perturbs harder in action unit
 
 ---
 
+## 25. Both fine-tunes measured properly — the gripper is the bottleneck, not the geometry
+
+**Protocol.** 10 rollouts each, identical seeds 1-10, 70 chunks, `--randomize-ball
+--randomize-bins`, each served at the scale its dataset was collected at, scored by
+`score_runs.py` (ball lifted 50 mm at some point, and ending inside the green bin's
+footprint).
+
+| | placed | grasp-and-lift | gripper ever closed |
+|---|---|---|---|
+| `a5` (scale 0.05, 539-tick expert) | **2/10** | **3/10** | 5/10 |
+| `a7` (scale 0.10, 334-tick expert) | **1/10** | **2/10** | 5/10 |
+| stock checkpoint (README sec.9, n=3) | 0/3 | 1/3 | — |
+
+2/10 against 1/10 at n=10 is noise, and `a7` had three runs truncated early (21, 13, 65
+chunks) which could not succeed, so its denominator is if anything unfair. **The two
+fine-tunes are indistinguishable on task success, and neither is clearly above a
+three-run stock baseline.**
+
+**The speed fix is real and did not help.** On the two seeds where both models succeeded,
+`a7` closed the gripper at chunks 10 and 7 where `a5` took 31 and 20 — the ~3x the dataset
+predicted. It converts into no additional placements.
+
+### 25.1 What actually gates success
+
+`score_runs.py`'s `close` column decides every run. Across **all 20 rollouts, every single
+lift and every single placement came from a run where the gripper fired at all** — and it
+fired in exactly 5 of 10 for both models. In the other half it never closed, and the arm
+either hovered over the ball or pushed it hundreds of millimetres across the table.
+
+Closure is also close to uncorrelated with whether the hand is on the ball:
+
+| | closest lateral | gripper |
+|---|---|---|
+| `a5` run 8 | **2.1 mm** | never closed |
+| `a5` run 1 | **0.7 mm** | closed at chunk 58, far too late |
+| `a5` run 9 | 37.0 mm | closed at chunk 16 |
+| `a7` run 4 | 90.8 mm | closed at 52, reopened at 53 |
+| `a7` run 8 | 39.1 mm | full close-transport-release on an empty hand |
+
+The two models fail in mirror-image ways — `a7` commits early (chunks 7, 8, 8, 10)
+whether or not the ball is there, `a5` closes late or not at all — which is the same
+missing capability, *closure conditioned on actually having the object*, expressed as
+opposite biases.
+
+### 25.2 Where that leaves sec.23-24
+
+The resolution model (15.5 / 23.5 / 40.0 mm per unit of normalised error for a5 / a7 / a6)
+is arithmetically correct and explains why `a6` could not touch the ball at all. It does
+**not** explain this data: `a7` has finer resolution than `a6` and reaches *worse than
+`a5`* on matched seeds (closest approaches 102 / 12.6 / 49.3 / 90.8 mm against `a5`'s
+0.7 / 20.6 / 34.7 / 15.1 mm). A model that predicts the opposite of what is observed is
+not the operative mechanism here, whatever its arithmetic.
+
+Honest summary of the whole sec.23-25 arc: **the slowness was real, was diagnosed
+correctly, was fixed — and was not the thing standing between this policy and the task.**
+Three datasets and two fine-tunes were spent on the action space's geometry while the
+binding constraint was a binary channel that neither dataset teaches reliably.
+
+### 25.3 Two things before any further training
+
+- **Runs truncate and I cannot say why.** Five rollouts across the two batches died early
+  (a5: 66, 61; a7: 21, 13, 65) with stdout sent to `/dev/null`. `libero_closed_loop.py`
+  exits rather than retries when a request fails, so one transient server error ends a
+  rollout. Every rate in this section carries that noise. Capture stderr, and add a retry.
+- **Attack closure, not geometry.** The expert only ever demonstrates closing on a
+  stationary, perfectly-centred ball, and rejection sampling on `lifted and placed`
+  deletes every episode where contact went wrong (sec.23.5). The states the policy
+  actually occupies at decision time are therefore absent from the data by construction.
+
+---
+
 ## Corrections to `PHASE5_PLAN.md`
 
 Things the plan asserts that later measurement contradicted:
