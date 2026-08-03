@@ -156,7 +156,7 @@ class OSCController:
 
         # Resolve the arm's qpos/dof indices by NAME rather than assuming 0..6. They do
         # happen to be 0..6 in this scene, but the scene also contains free-joint objects
-        # (green_ball, red_box) and the two finger joints, so nv is 21, not 7 -- slicing
+        # (green_box, red_box) and the two finger joints, so nv is 21, not 7 -- slicing
         # a 21x21 mass matrix with [:7] would be right by luck and wrong the moment a
         # body is added above the robot in the tree.
         self.qpos_idx = np.array(
@@ -167,6 +167,12 @@ class OSCController:
              for n in ARM_JOINT_NAMES], dtype=int)
 
         self.torque_limits = model.actuator_ctrlrange[:7].copy()
+        # Per-joint magnitude bound, for reporting headroom as a fraction. Taken as the
+        # larger of |lo| and |hi| rather than assuming symmetry -- it IS symmetric in this
+        # scene (+-80 on j1-5, +-12 on j6-7), but an asymmetric ctrlrange would otherwise
+        # silently report >100% headroom on the wider side.
+        self._limit_mag = np.maximum(np.abs(self.torque_limits[:, 0]),
+                                     np.abs(self.torque_limits[:, 1]))
 
         self._jacp = np.zeros((3, model.nv))
         self._jacr = np.zeros((3, model.nv))
@@ -178,6 +184,12 @@ class OSCController:
         # Diagnostics, read by the closed loop for logging.
         self.last_saturated = 0
         self.last_torque = np.zeros(7)
+        # Largest |torque| / limit over the 7 joints at the last physics step, measured
+        # BEFORE the clip. A saturation COUNT only says a joint hit the rail; this says how
+        # hard it was pushing on it, and it is the only signal that distinguishes "0.99 of
+        # the limit, fine" from "3x the limit, the controller is asking for motion this arm
+        # cannot make". >= 1.0 exactly when last_saturated > 0.
+        self.last_peak_frac = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -283,6 +295,11 @@ class OSCController:
         torques = torques + nullspace_torques(
             mass_matrix, nullspace_matrix, self.initial_joint, joint_pos, joint_vel,
             joint_kp=self.nullspace_kp)
+
+        # Headroom BEFORE the clip, so an over-limit demand is visible as its true size
+        # rather than flattened to exactly the limit. Recorded every physics step; the
+        # collector maxes it over the episode and rejects on it (--max-torque-frac).
+        self.last_peak_frac = float(np.max(np.abs(torques) / self._limit_mag))
 
         clipped = np.clip(torques, self.torque_limits[:, 0], self.torque_limits[:, 1])
         # MuJoCo would clip these anyway (ctrllimited="true"), but doing it here lets the

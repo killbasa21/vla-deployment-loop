@@ -1,0 +1,25 @@
+[project]
+name = "greenbox"
+version = "0.1.0"
+description = "SmolVLA fine-tune on a robosuite pick-and-place task: green box into the green container"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "robosuite==1.4.1",
+    "mujoco>=3.1,<3.2",
+    "numpy<2",
+    "imageio[ffmpeg]>=2.34",
+    "tqdm>=4.66",
+    "requests>=2.32",
+    "termcolor",
+]
+
+# lerobot is NOT installable here: it requires numpy>=2, robosuite 1.4.1 requires
+# numpy<2. Anything that touches LeRobotDataset lives in the separate .venv-lerobot
+# (see tools/convert_to_lerobot.py and README "Environments").
+[project.optional-dependencies]
+modal = ["modal>=0.64"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]

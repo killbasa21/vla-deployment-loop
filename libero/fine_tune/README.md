@@ -1,5 +1,15 @@
 # `libero/fine_tune` — training data for a LoRA + action-expert fine-tune
 
+> **Pick target changed 2026-08-03: 40 mm sphere → 40 mm cube**, instruction now *"pick up
+> the green box and put it in the green container"*, scene identifiers renamed
+> `green_ball*` → `green_box*`. Rationale and full change list in
+> [`libero/PROGRESS.md` §26](../PROGRESS.md).
+>
+> **Everything measured on this page was measured on the ball**, including every dataset and
+> checkpoint it names. The prose below has deliberately NOT been reworded — the measurements
+> describe a sphere and would be false if restated about a cube. Command lines HAVE been
+> updated, since the old flag names no longer exist.
+
 Scripted expert demonstrations of the green-ball pick-and-place task, recorded in the
 **LIBERO** convention and written as a **LeRobot v3.0** dataset that matches
 `allenai/MolmoAct2-LIBERO-Dataset` field for field.
@@ -540,7 +550,7 @@ Two things follow, and both matter:
 Separate issue, found alongside the above, and it costs sample efficiency rather than
 speed. `bin_layout()` permutes green/blue/yellow across three slots with ±2 cm of jitter
 every episode. `libero_closed_loop.py` randomises nothing about the bins — it has
-`--randomize-ball` and no bin equivalent — so every evaluation runs the scene XML's own
+`--randomize-box` and no bin equivalent — so every evaluation runs the scene XML's own
 layout, green at **(0.56, 0.25)**. In `a5` that layout drew **6 of 30 episodes**; the
 remaining 24 demonstrate reaching toward bins that are not present at inference, and the
 colour-grounding skill they buy is never tested.
@@ -558,7 +568,7 @@ Two coherent resolutions, and the mismatch is the only indefensible option:
   working demo is the goal rather than colour grounding.
 
 Note this is orthogonal to the ball, which is randomised on both sides already
-(`BALL_SAMPLE_X/Y`, and `--randomize-ball` at inference), so the grasp stays a real
+(`BALL_SAMPLE_X/Y`, and `--randomize-box` at inference), so the grasp stays a real
 closed-loop problem either way.
 
 ### 8.3 The speed/precision frontier — why `a6` is fast and misses (2026-08-01)
@@ -596,7 +606,7 @@ uv run python smolvla_libero/convert_dataset.py --src libero/fine_tune/a6 \
     --out smolvla_libero/data/a6_smolvla
 # then serve, and run the client at the SAME scale, with bins randomised to match:
 uv run python libero/libero_closed_loop.py --delta-pos-scale 0.20 --randomize-bins \
-    --randomize-ball --server-url <url>/act
+    --randomize-box --server-url <url>/act
 ```
 
 Before spending that: `libero_closed_loop.py --action-scale 2.0` puts a gain on the

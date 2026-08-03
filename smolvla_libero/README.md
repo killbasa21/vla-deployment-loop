@@ -1,5 +1,15 @@
 # `smolvla_libero/` — SmolVLA-450M on the green-ball task
 
+> **Pick target changed 2026-08-03: 40 mm sphere → 40 mm cube**, instruction now *"pick up
+> the green box and put it in the green container"*, scene identifiers renamed
+> `green_ball*` → `green_box*`. Rationale and full change list in
+> [`libero/PROGRESS.md` §26](../libero/PROGRESS.md).
+>
+> **Everything measured on this page was measured on the ball**, including every dataset and
+> checkpoint it names. The prose below has deliberately NOT been reworded — the measurements
+> describe a sphere and would be false if restated about a cube. Command lines HAVE been
+> updated, since the old flag names no longer exist.
+
 Running **`HuggingFaceVLA/smolvla_libero`** — HuggingFace's official SmolVLA-450M fine-tuned
 on LIBERO — against this project's MuJoCo Panda scene.
 
@@ -19,7 +29,7 @@ or the run is not measuring `a6`:
 
 ```bash
 uv run python libero/libero_closed_loop.py --delta-pos-scale 0.20 \
-    --randomize-bins --randomize-ball --server-url <url>/act
+    --randomize-bins --randomize-box --server-url <url>/act
 ```
 
 ## Why this checkpoint
@@ -148,7 +158,7 @@ Then the existing closed loop, unmodified:
 uv run python libero/libero_closed_loop.py \
     --payload-keys libero \
     --server-url https://<printed-url>/act \
-    --chunks 20 --randomize-ball --no-view \
+    --chunks 20 --randomize-box --no-view \
     --run-id smolvla_stock_00
 ```
 

@@ -8,7 +8,7 @@ NO CHANGES ARE NEEDED IN THE SIM CLIENT:
 
     uv run python libero/libero_closed_loop.py \
         --payload-keys libero --server-url https://<printed-url>/act \
-        --delta-pos-scale 0.10 --randomize-bins --randomize-ball \
+        --delta-pos-scale 0.10 --randomize-bins --randomize-box \
         --chunks 25 --no-view --run-id act_ck60000_00
 
 `--payload-keys libero` sends `{image, wrist_image, instruction, state}`. The `droid` default
@@ -55,6 +55,7 @@ import modal
 # module inside the container -- where infra/ lands on /root via with_infra().
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from infra.modal_images import lerobot_serve_image, with_infra
+from infra.task_spec import INSTRUCTION
 
 # Absolute path on the checkpoints volume, or an HF repo id. No default that points at a real
 # run: a stale default is how the wrong checkpoint gets measured.
@@ -338,7 +339,7 @@ def smoke_test():
     payload = {
         "image": np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8),
         "wrist_image": np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8),
-        "instruction": "pick up the green ball and put it in the green container",
+        "instruction": INSTRUCTION,
         "state": np.zeros(8, dtype=np.float32),
     }
     resp = requests.post(f"{url}/act", data=json_numpy.dumps(payload).encode(),

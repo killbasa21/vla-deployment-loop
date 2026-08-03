@@ -20,7 +20,7 @@ NO CHANGES ARE NEEDED IN THE SIM CLIENT. Run it with the LIBERO payload keys it 
     uv run python libero/libero_closed_loop.py \
         --payload-keys libero \
         --server-url https://<...>.modal.run/act \
-        --chunks 20 --randomize-ball --no-view
+        --chunks 20 --randomize-box --no-view
 
 `--payload-keys libero` sends `{image, wrist_image, instruction, state}`; this server maps
 `wrist_image` onto the model's `observation.images.image2` feature. That mapping is the whole
@@ -75,7 +75,7 @@ Usage:
     SMOLVLA_CHECKPOINT=/checkpoints/smolvla/smolvla-a6-lora/checkpoints/005000/pretrained_model \
         modal deploy smolvla_libero/smolvla_modal.py
     uv run python libero/libero_closed_loop.py --payload-keys libero \
-        --delta-pos-scale 0.20 --randomize-bins --randomize-ball \
+        --delta-pos-scale 0.20 --randomize-bins --randomize-box \
         --chunks 20 --no-view --server-url https://<...>.modal.run/act
 """
 
@@ -90,6 +90,7 @@ import modal
 # module inside the container -- where infra/ lands on /root via with_infra().
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from infra.modal_images import lerobot_serve_image, with_infra
+from infra.task_spec import INSTRUCTION
 
 # Which weights to serve. Defaults to the stock HuggingFace checkpoint; set
 # SMOLVLA_CHECKPOINT to a path on the `molmoact2-checkpoints` volume to serve one of our
@@ -403,7 +404,7 @@ def smoke_test(gpu: str = GPU):
     payload = {
         "image": rng.integers(0, 255, (256, 256, 3), dtype=np.uint8),
         "wrist_image": rng.integers(0, 255, (256, 256, 3), dtype=np.uint8),
-        "instruction": "pick up the green ball and put it in the green container",
+        "instruction": INSTRUCTION,
         # A plausible LIBERO reset state, not zeros: eef above the table, top-down
         # orientation (axis-angle magnitude ~pi), gripper open at the mirrored (+x, -x).
         "state": np.array([-0.05, 0.0, 1.19, 3.14, 0.0, -0.09, 0.04, -0.04], dtype=np.float32),

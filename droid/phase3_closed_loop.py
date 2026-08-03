@@ -21,6 +21,7 @@ import argparse
 import itertools
 import json
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,6 +32,9 @@ import mujoco.viewer
 import numpy as np
 import requests
 from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.task_spec import INSTRUCTION  # noqa: E402  shared with libero/, act/, smolvla_libero/
 
 json_numpy.patch()
 
@@ -44,7 +48,6 @@ DEFAULT_MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_pick_place.xml"
 # here) and verified by offscreen rendering instead.
 DROID_MODEL_PATH = "mujoco_menagerie/franka_fr3/scene_droid.xml"
 SERVER_URL = "http://1.193.138.57:34011/act"
-INSTRUCTION = "pick up the green ball and put it in the green container"
 
 # MolmoAct2's own image processor resizes every input image to 378x378 internally
 # (see processor_config.json). We used to render much smaller than that (128x128)
@@ -207,15 +210,15 @@ FREE_BODY_INITIAL_POSES = {
     # static distractor on every single training episode -- match that exactly, since that's the
     # position the green_ball_pick fine-tune's images actually show it at.
     "red_box": ((0.5, -0.28, 0.02), (1, 0, 0, 0)),
-    "green_ball": ((0.45, -0.1, 0.02), (1, 0, 0, 0)),
+    "green_box": ((0.45, -0.1, 0.02), (1, 0, 0, 0)),
     "lego_duplo": ((0.45, 0.20, 0.4095), (1, 0, 0, 0)),
     "tennis_ball": ((0.45, -0.20, 0.433), (1, 0, 0, 0)),
 }
 
-# green_ball's training-time xy distribution -- droid/phase4_collect_demos.py's sample_ball_xy().
-# --randomize-ball draws from this same range so the sim replicates the training distribution
+# green_box's training-time xy distribution -- droid/phase4_collect_demos.py's sample_box_xy().
+# --randomize-box draws from this same range so the sim replicates the training distribution
 # instead of always using FREE_BODY_INITIAL_POSES' single fixed spot.
-GREEN_BALL_XY_RANGE = ((0.40, 0.58), (-0.16, 0.14))
+GREEN_BOX_XY_RANGE = ((0.40, 0.58), (-0.16, 0.14))
 
 # Where --hide-red-box parks red_box: far outside both cameras' frustums and below the floor,
 # so it doesn't just sit off to the side still visible in a wide shot. Physics-inert once here
@@ -239,12 +242,12 @@ BIN_NAMES = ("green_bin", "blue_bin", "yellow_bin")
 # Which of FREE_BODY_INITIAL_POSES' bodies (in priority order) gets its pose logged/returned as
 # this run's single "tracked object" -- mirrors the old red_box-only tracking, just extended to
 # pick the first match present in whichever scene got loaded rather than hardcoding red_box.
-# green_ball first: it's the actual Phase 4 fine-tune target (see droid/phase4_collect_demos.py),
+# green_box first: it's the actual Phase 4 fine-tune target (see droid/phase4_collect_demos.py),
 # scene_pick_place.xml has both it and red_box (a distractor there), so it must outrank red_box.
-TRACKED_OBJECT_CANDIDATES = ["green_ball", "red_box", "lego_duplo"]
+TRACKED_OBJECT_CANDIDATES = ["green_box", "red_box", "lego_duplo"]
 
 
-def build_sim(model_path, randomize_ball=False, hide_red_box=False, randomize_bins=False, rng=None):
+def build_sim(model_path, randomize_box=False, hide_red_box=False, randomize_bins=False, rng=None):
     model = mujoco.MjModel.from_xml_path(model_path)
     data = mujoco.MjData(model)
 
@@ -252,11 +255,11 @@ def build_sim(model_path, randomize_ball=False, hide_red_box=False, randomize_bi
     mujoco.mj_resetDataKeyframe(model, data, home_id)
 
     poses = dict(FREE_BODY_INITIAL_POSES)
-    if randomize_ball:
+    if randomize_box:
         rng = rng or np.random.default_rng()
-        (x_lo, x_hi), (y_lo, y_hi) = GREEN_BALL_XY_RANGE
-        ball_xy = (rng.uniform(x_lo, x_hi), rng.uniform(y_lo, y_hi))
-        poses["green_ball"] = ((ball_xy[0], ball_xy[1], 0.02), (1, 0, 0, 0))
+        (x_lo, x_hi), (y_lo, y_hi) = GREEN_BOX_XY_RANGE
+        box_xy = (rng.uniform(x_lo, x_hi), rng.uniform(y_lo, y_hi))
+        poses["green_box"] = ((box_xy[0], box_xy[1], 0.02), (1, 0, 0, 0))
     if hide_red_box:
         poses["red_box"] = RED_BOX_HIDDEN_POSE
 
@@ -397,12 +400,12 @@ def main():
         ),
     )
     parser.add_argument(
-        "--randomize-ball",
+        "--randomize-box",
         action="store_true",
         help=(
-            "place green_ball at a random xy drawn from the same range "
-            "droid/phase4_collect_demos.py's sample_ball_xy() used for training "
-            f"({GREEN_BALL_XY_RANGE}), instead of its single fixed default spot"
+            "place green_box at a random xy drawn from the same range "
+            "droid/phase4_collect_demos.py's sample_box_xy() used for training "
+            f"({GREEN_BOX_XY_RANGE}), instead of its single fixed default spot"
         ),
     )
     parser.add_argument(
@@ -426,7 +429,7 @@ def main():
     parser.add_argument(
         "--seed",
         type=int, default=None,
-        help="seed for --randomize-ball/--randomize-bins' rng, for reproducibility",
+        help="seed for --randomize-box/--randomize-bins' rng, for reproducibility",
     )
     parser.add_argument(
         "--replan-at",
@@ -460,12 +463,12 @@ def main():
     model_path = DROID_MODEL_PATH if args.model_path == "droid" else args.model_path
     rng = (
         np.random.default_rng(args.seed)
-        if (args.randomize_ball or args.randomize_bins) else None
+        if (args.randomize_box or args.randomize_bins) else None
     )
 
     model, data = build_sim(
         model_path,
-        randomize_ball=args.randomize_ball,
+        randomize_box=args.randomize_box,
         hide_red_box=args.hide_red_box,
         randomize_bins=args.randomize_bins,
         rng=rng,

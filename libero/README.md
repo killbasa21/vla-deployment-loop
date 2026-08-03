@@ -1,5 +1,15 @@
 # `libero/` — MolmoAct2-LIBERO closed loop
 
+> **Pick target changed 2026-08-03: 40 mm sphere → 40 mm cube**, instruction now *"pick up
+> the green box and put it in the green container"*, scene identifiers renamed
+> `green_ball*` → `green_box*`. Rationale and full change list in
+> [`libero/PROGRESS.md` §26](PROGRESS.md).
+>
+> **Everything measured on this page was measured on the ball**, including every dataset and
+> checkpoint it names. The prose below has deliberately NOT been reworded — the measurements
+> describe a sphere and would be false if restated about a cube. Command lines HAVE been
+> updated, since the old flag names no longer exist.
+
 Self-contained port of the phase-3 closed loop to the **`allenai/MolmoAct2-LIBERO`**
 checkpoint. Deliberately decoupled from `droid/phase3_closed_loop.py` (copy-paste, not import)
 so the DROID path keeps working untouched while this one is in flux.

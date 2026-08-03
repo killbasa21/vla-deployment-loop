@@ -78,12 +78,13 @@ Usage:
     # serving a fine-tune: the scale and the bin randomisation must match COLLECTION.
     # a6 was 0.20, a7 is 0.10 -- check the dataset, do not assume.
     uv run python libero/libero_closed_loop.py --delta-pos-scale 0.10 \
-        --randomize-bins --randomize-ball --chunks 25 --server-url <url>/act
+        --randomize-bins --randomize-box --chunks 25 --server-url <url>/act
 """
 
 import argparse
 import itertools
 import json
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -112,10 +113,13 @@ json_numpy.patch()
 # load. See that file's header. scene_pick_place.xml is left alone so the DROID loop and
 # the already-collected dataset are unaffected.
 #
-# This matters more than it sounds. At scene_pick_place.xml's framing a 40 mm ball is
+# This matters more than it sounds. At scene_pick_place.xml's framing a 40 mm target is
 # 4.9 px at 256x256 (7.3 px at 378) -- below one ViT patch, i.e. not localizable at all.
 # Matched to LIBERO it is 16.0 px (analytic and measured agree exactly). That 3.3x is the
-# single largest divergence from the pretraining distribution we found.
+# single largest divergence from the pretraining distribution we found. Those pixel figures
+# were measured on the 40 mm sphere; the 40 mm cube that replaced it on 2026-08-03 subtends
+# the same width across a face and slightly more across a diagonal, so they are a lower
+# bound, not a stale number.
 #
 # scene_libero_hand.xml, not scene_libero.xml: same scene, but with the STOCK FRANKA HAND
 # instead of the Robotiq 2F-85. LIBERO was pretrained on the stock hand, and the 2F-85
@@ -133,7 +137,17 @@ SCENE_FOR_MODE = {
 }
 DEFAULT_MODEL_PATH = SCENE_FOR_MODE["ik"]   # kept: imported by score_runs.py's --model-path
 SERVER_URL = "http://localhost:8000/act"
-INSTRUCTION = "pick up the green ball and put it in the green container"
+
+# The instruction lives in infra/task_spec.py so the collector, this client and all three
+# policy servers cannot drift apart -- a prompt mismatch between training and serving does
+# not error, it just conditions on a string the policy never saw. Re-exported here because
+# collect_finetune_data.py and score_runs.py already import this module as `L`.
+try:
+    from infra.task_spec import INSTRUCTION, TARGET_BODY, TARGET_GEOM
+except ImportError:  # not run from the repo root
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from infra.task_spec import INSTRUCTION, TARGET_BODY, TARGET_GEOM
 
 # Our scene's camera names, mapped onto LIBERO's two. Both are now robosuite's own
 # cameras copied verbatim rather than anything we designed: `eye_in_hand` replaces the
@@ -144,7 +158,7 @@ WRIST_CAMERA = "eye_in_hand"        # <- LIBERO's `robot0_eye_in_hand` / `.wrist
 # LIBERO's own render size (lerobot/envs/libero.py:109-110). Matching it avoids an extra
 # resample (MolmoAct2's processor resizes to 378 internally either way) and matches the
 # effective detail level of the training frames. Overridable with --render-size: at the
-# matched camera 256 already puts the ball at 16 px, but 378 gives 23.7 px if you want
+# matched camera 256 already puts the target at 16 px, but 378 gives 23.7 px if you want
 # the headroom, at the cost of a larger payload and a mismatch with LIBERO's native size.
 RENDER_HEIGHT = 256
 RENDER_WIDTH = 256
@@ -293,10 +307,11 @@ TABLE_TOP_Z = -0.012
 # the hand (it used to be 6.1-12.1 mm, and the whole 9.5 mm difference is that move). A
 # 16 mm floor therefore leaves the hardware ~0.5 mm clear of the surface at the limit.
 #
-# It still does not cost grasp height. The ball centre is 20 mm above the table, so a
-# 16 mm floor on the site permits descending 4 mm PAST the ball's equator -- grip_site is
-# now robosuite's own grasp point, so aiming it straight at the object centre, which is
-# what LIBERO's demonstrations do, is inside the allowed range.
+# It still does not cost grasp height. The box centre is 20 mm above the table (half of a
+# 40 mm cube, same as the sphere radius it replaced), so a 16 mm floor on the site permits
+# descending 4 mm PAST the centre -- grip_site is now robosuite's own grasp point, so aiming
+# it straight at the object centre, which is what LIBERO's demonstrations do, is inside the
+# allowed range.
 #
 # It is still a departure from LIBERO's control law -- the model asks for a pose and we
 # decline part of it. Pass a NEGATIVE --min-clearance to switch it off entirely.
@@ -701,21 +716,34 @@ def capture_and_submit(executor, renderer, data, model, site_id, finger_qposadr,
     return future, t0, obs_snapshot, tick
 
 
-# Freejoint objects now rest ON THE TABLE (top at TABLE_TOP_Z), not on the floor. Sphere
-# and box centres sit one half-extent above the surface. Same fix as phase3/phase4 is still
-# needed: the "home" keyframe predates these freejoints, so mj_resetDataKeyframe zero-pads
-# their qpos to the world origin instead of their intended resting pose.
+# Freejoint objects rest ON THE TABLE (top at TABLE_TOP_Z), not on the floor. Their centres
+# sit one half-extent above the surface. Same fix as phase3/phase4 is still needed: the
+# "home" keyframe predates these freejoints, so mj_resetDataKeyframe zero-pads their qpos to
+# the world origin instead of their intended resting pose.
+# The scene's own half-extent for the pick target (scene_libero_*.xml: green_box_geom
+# size="0.02 0.02 0.02", i.e. a 40 mm cube). Kept here as well so the spawn height, the
+# gripper-clearance check and score_runs.py's lift/place thresholds all move together when
+# --box-size overrides it. The XML stays the source of truth for the DEFAULT -- build_sim
+# reads the compiled geom and only writes to it when the flag is passed, per the repo rule
+# about never trusting an XML you did not compile.
+#
+# Was BALL_RADIUS, a sphere radius, until 2026-08-03. Numerically identical (0.02) because
+# the cube was sized to the same 40 mm across, so every height that derives from it is
+# unchanged -- which is the point: the box scene differs from the ball scene in the object's
+# SHAPE and nothing else.
+BOX_HALF = 0.02
+
 FREE_BODY_INITIAL_POSES = {
-    "green_ball": (0.56, 0.0, TABLE_TOP_Z + 0.02),
+    TARGET_BODY: (0.56, 0.0, TABLE_TOP_Z + BOX_HALF),
     "red_box": (0.56, -0.28, TABLE_TOP_Z + 0.02),
 }
 # NOTE both follow TABLE_TOP_Z, so raising the table on 2026-07-28 carried them with it.
-# Ball sampling box, kept on the table surface and around its centre (0.56, 0) so the
-# ball stays inside the 0.8x0.8 m top and within comfortable reach. Deliberately tighter
+# Target sampling box, kept on the table surface and around its centre (0.56, 0) so the
+# object stays inside the 0.8x0.8 m top and within comfortable reach. Deliberately tighter
 # than droid/phase4_collect_demos.py's floor-scene box, which was anchored to a different frame.
-BALL_SAMPLE_X = (0.46, 0.66)
-BALL_SAMPLE_Y = (-0.12, 0.12)
-TRACKED_OBJECT_CANDIDATES = ("green_ball", "red_box")
+BOX_SAMPLE_X = (0.46, 0.66)
+BOX_SAMPLE_Y = (-0.12, 0.12)
+TRACKED_OBJECT_CANDIDATES = (TARGET_BODY, "red_box")
 
 
 def is_torque_actuated(model):
@@ -762,10 +790,57 @@ def randomize_bins(model, rng):
     return green_xy
 
 
-def build_sim(model_path, randomize_ball=False, rng=None, control_mode="osc",
-              randomize_bin_layout=False):
+def set_box_half_extent(model, half):
+    """Resize green_box_geom in the COMPILED model and check it still fits the hand.
+
+    Written against the compiled geom rather than the XML on purpose: scene_libero_*.xml is
+    gitignored and has no history, so an override that lives in tracked Python is the only
+    version of this change that survives (CLAUDE.md, "verify plant parameters by compiling
+    the model"). Mass is deliberately NOT rescaled -- the point of the experiment is to vary
+    apparent size, and holding mass fixed keeps the friction budget that the contact params
+    on this geom were tuned for.
+
+    `half` is a HALF-EXTENT, so the cube is 2*half across, matching the sphere-radius
+    convention this replaced. All three components are written: an anisotropic target would
+    make "how wide is it in the image" depend on yaw, and nothing downstream models that.
+
+    Returns the half-extent actually set.
+    """
+    gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TARGET_GEOM)
+    if gid == -1:
+        raise SystemExit(f"no {TARGET_GEOM} in the scene; cannot apply --box-size")
+
+    # Max finger separation, read off the compiled joint limits rather than the 80 mm quoted
+    # in the XML comment. Each finger slides over its own range; the opening is their sum.
+    opening = 0.0
+    for jname in ("finger_joint1", "finger_joint2"):
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+        if jid != -1:
+            lo, hi = model.jnt_range[jid]
+            opening += abs(float(hi) - float(lo))
+    # Check the WORST case, not the nominal one. A cube presents 2*half across a face but
+    # 2*half*sqrt(2) across its diagonal, and after a failed grasp it can be sitting at any
+    # yaw -- so the face width is the number that flatters us and the diagonal is the number
+    # that has to fit. (A sphere had no such distinction, which is why this is new.)
+    widest = 2 * half * math.sqrt(2)
+    if opening > 0 and widest > opening - 0.005:
+        raise SystemExit(
+            f"--box-size {half} gives a {2 * half * 1000:.0f} mm box, {widest * 1000:.0f} mm "
+            f"across its diagonal, but the hand opens {opening * 1000:.0f} mm. Refusing: with "
+            "under 5 mm of total clearance the fingers collide with the box on approach at "
+            "some yaws and every failure is the scene's, not the policy's."
+        )
+
+    model.geom_size[gid, :3] = half
+    return half
+
+
+def build_sim(model_path, randomize_box=False, rng=None, control_mode="osc",
+              randomize_bin_layout=False, box_half=None):
     """Returns (model, data, osc). `osc` is None in ik mode."""
     model = mujoco.MjModel.from_xml_path(model_path)
+    if box_half is not None:
+        set_box_half_extent(model, box_half)
     data = mujoco.MjData(model)
     home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if home != -1:
@@ -810,9 +885,14 @@ def build_sim(model_path, randomize_ball=False, rng=None, control_mode="osc",
             continue
         adr = model.jnt_qposadr[jid]
         xyz = np.array(pos, dtype=float)
-        if name == "green_ball" and randomize_ball and rng is not None:
-            xyz[0] = rng.uniform(*BALL_SAMPLE_X)
-            xyz[1] = rng.uniform(*BALL_SAMPLE_Y)
+        if name == TARGET_BODY:
+            # Rest ON the table, not intersecting it: a bigger cube's centre sits higher.
+            # Without this the settle loop below launches the box out of the table.
+            if box_half is not None:
+                xyz[2] = TABLE_TOP_Z + box_half
+            if randomize_box and rng is not None:
+                xyz[0] = rng.uniform(*BOX_SAMPLE_X)
+                xyz[1] = rng.uniform(*BOX_SAMPLE_Y)
         data.qpos[adr:adr + 3] = xyz
         data.qpos[adr + 3:adr + 7] = [1, 0, 0, 0]
 
@@ -942,7 +1022,18 @@ def main():
             "repo id, '<run>_<step>' for a checkpoint on the Modal volume)."
         ),
     )
-    parser.add_argument("--randomize-ball", action="store_true")
+    parser.add_argument("--randomize-box", action="store_true")
+    parser.add_argument(
+        "--box-size", type=float, default=None, metavar="M",
+        help=(
+            f"override {TARGET_GEOM}'s HALF-EXTENT in metres (scene default {BOX_HALF}, "
+            "i.e. a 40 mm cube). Resizes the compiled geom and raises the spawn height to "
+            "match; mass is left alone. DIAGNOSTIC ONLY -- every checkpoint in this repo "
+            "was trained on the default, so any run with this flag set is off-distribution "
+            "and must not enter a headline rate. Refuses a box whose DIAGONAL the hand "
+            "cannot open around."
+        ),
+    )
     parser.add_argument(
         "--randomize-bins", action="store_true",
         help=(
@@ -989,7 +1080,7 @@ def main():
         "--render-size", type=int, default=RENDER_HEIGHT,
         help=(
             f"square render size for both cameras (default {RENDER_HEIGHT}, LIBERO's own). "
-            "At the matched agentview a 40 mm ball is 16.0 px here and 23.7 px at 378; "
+            "At the matched agentview a 40 mm target is 16.0 px here and 23.7 px at 378; "
             "378 buys detail but diverges from LIBERO's native size and grows the payload"
         ),
     )
@@ -1055,13 +1146,18 @@ def main():
 
     send_wrist = not args.no_wrist_to_model
     rng = (np.random.default_rng(args.seed)
-           if (args.randomize_ball or args.randomize_bins) else None)
+           if (args.randomize_box or args.randomize_bins) else None)
     if args.model_path is None:
         args.model_path = SCENE_FOR_MODE[args.control_mode]
     model, data, osc = build_sim(
-        args.model_path, randomize_ball=args.randomize_ball, rng=rng,
+        args.model_path, randomize_box=args.randomize_box, rng=rng,
         control_mode=args.control_mode, randomize_bin_layout=args.randomize_bins,
+        box_half=args.box_size,
     )
+    # Read it back off the compiled model so the log records what the sim ACTUALLY ran with,
+    # not what was asked for -- the same reason green_bin_xy is logged rather than assumed.
+    _box_gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, TARGET_GEOM)
+    box_half = (float(model.geom_size[_box_gid, 0]) if _box_gid != -1 else BOX_HALF)
 
     # Read the green bin off the BUILT model, not the XML: with --randomize-bins the two
     # disagree, and the built model is the one the run actually happens in. Logged on every
@@ -1276,6 +1372,16 @@ def main():
                 # on every line rather than once, so the file stays self-contained under
                 # `tail -f` like the rest of this format. See score_runs.green_bin_xy.
                 "green_bin_xy": green_bin_xy,
+                # Same argument as green_bin_xy: the scorer's lift and placement heights are
+                # both measured from the target's centre, so they are wrong by the delta if
+                # the geom was resized and the log does not say so.
+                #
+                # Renamed from `ball_radius` on 2026-08-03 with the sphere -> cube change.
+                # Both keys mean "half the object's width" and both hold 0.02 by default, so
+                # score_runs.py reads either; the rename is what makes an old ball log and a
+                # new box log distinguishable at all, since nothing else in the format
+                # records the object's shape.
+                "box_half": box_half,
                 # How many chunks this run was ASKED for. Without it there is no way to tell
                 # a finished 40-chunk run from one that is still in flight or was killed --
                 # and score_runs.py reads logs while they are being written (the file is

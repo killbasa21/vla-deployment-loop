@@ -1,12 +1,27 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in this repository. Current as of **2026-08-02**.
+Guidance for Claude Code working in this repository. Current as of **2026-08-03**.
 
 ## What this repo is
 
 A learning project about the full VLA deployment loop: a Franka Panda in MuJoCo locally, a
-policy server on Modal, HTTP between them, and one task — *pick up the green ball and put
+policy server on Modal, HTTP between them, and one task — *pick up the green box and put
 it in the green container* — that has to actually succeed.
+
+**The pick target changed on 2026-08-03 and the box is now the default everywhere.** 40 mm
+sphere → 40 mm cube; instruction changed to match; scene identifiers renamed `green_ball*`
+→ `green_box*` in all four scene XMLs; flags renamed `--randomize-ball` → `--randomize-box`
+and `--ball-radius` → `--box-size` (still a half-extent). Rationale and the full change list
+are in `libero/PROGRESS.md` §26. There is no ball mode and no flag to get one back — the
+sphere is recoverable only from git history plus the scene XMLs, which are gitignored.
+
+Everything that reads the scene picks this up with no argument: `libero_closed_loop.py`,
+`libero/fine_tune/collect_finetune_data.py` (so **freshly collected demos are box demos by
+default**), `score_runs.py`, all three policy servers, and the retired `droid/` scripts.
+
+**Every score in this file and in `README.md`, and every dataset `a1`–`a7` plus their
+`*_smolvla` conversions, was produced with the ball.** Do not compare a box run to them, and
+do not rename their Modal volume paths — those still hold ball data.
 
 Four policies have been driven through the same loop. **Read `README.md` for the current
 scores and `PROGRESS.md` for how the project got here** before proposing any change to a
@@ -40,8 +55,26 @@ track; both are short and both are kept current.
 - **`--delta-pos-scale` at serving must equal the dataset's collection value** (0.10 for
   `a7`, 0.20 for `a6`, 0.05 for `a5`), and `--payload-keys libero` is required for every
   non-DROID server. A mismatch does not measure that fine-tune at all.
+- **`--delta-pos-scale` is 0.05 from 2026-08-03 on — LIBERO's own value, and the code
+  default on both sides. Do not pass the flag.** The box-task collections and every
+  fine-tune trained on them use it. The point is that 0.05 makes our action space
+  *identical* to what the stock checkpoints were pretrained on rather than a rescale of it:
+  same 7-D delta eef pose in [-1,1], same 8-D LIBERO-frame state, same Panda, same
+  robosuite OSC_POSE port, same 20 Hz. The line above still governs `a5`–`a7`, which were
+  collected at other values and must still be *served* at those values.
+  Clipping is handled by `--motion-speed`, not by shrinking the scale: `--speed-scale` no
+  longer stacks on top of the retiming (that double-slowdown was live at exactly 0.05).
+  Not yet measured at 0.05 + `--motion-speed`: the label distribution. `a5` is the only
+  0.05 collection and it predates `--motion-speed`, so its pinned `dx q01 = -1.000` is not
+  evidence about this setting. Check `dx q01` against released LIBERO's −0.679 on the first
+  box collection before trusting a score from it.
 - **Progress logs keep the wrong turns in.** Append corrections as new sections; never edit
-  a conclusion out of an old one. Knowing which claims were reversed is the point.
+  a conclusion out of an old one. Knowing which claims were reversed is the point. This is
+  why the ball→box change of 2026-08-03 rewrote the *code* everywhere but left every
+  historical measurement, and its "ball" wording, exactly where it was.
+- **The instruction string lives in `infra/task_spec.py`,** not in each track. It was copied
+  into five files until 2026-08-03; a training/serving mismatch there does not error, it
+  just conditions the policy on a prompt it never saw.
 - **Run everything from the repo root.** Scene XML, `assets/` and `molmoact2/experiments`
   paths all resolve relative to the working directory, not to the script.
 

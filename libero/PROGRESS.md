@@ -1518,6 +1518,108 @@ binding constraint was a binary channel that neither dataset teaches reliably.
 
 ---
 
+## 26. The pick target is a cube now, not a sphere
+
+**Changed, 2026-08-03.** `green_ball` (sphere, r=0.02) → `green_box` (box, half-extent
+0.02 0.02 0.02) in all four scene XMLs. Same 40 mm across a face, same 0.05 kg, same
+material, same contact params. The instruction changed with it:
+
+```
+- pick up the green ball and put it in the green container
++ pick up the green box  and put it in the green container
+```
+
+**Nothing has been run yet.** This section records a change and its reasoning, not a
+result. Every number in sec.1-25 was measured on the sphere.
+
+### 26.1 Why
+
+sec.25.1 is the whole argument. Across all 20 rollouts of the two MolmoAct2 fine-tunes,
+every lift and every placement came from a run where the gripper fired at all, and it
+fired in exactly 5 of 10 for both models. Closure was near-uncorrelated with whether the
+hand was on the object: `a5` run 8 reached **2.1 mm** and never closed; `a7` run 8 did a
+full close-transport-release on an empty hand.
+
+A sphere is the worst possible object for that failure. It has one contact point, no face
+to align to, and it rolls out from under a closing gripper — which is exactly why
+`scene_libero_*.xml` carries a block of hand-tuned contact params (`priority 2`,
+`condim 4`, stiff `solref`/`solimp`) that exists *only* because "a 40 mm sphere between
+two flat pads has no form closure". Those params were added on 2026-07-28 after tracing
+the fingers seating at 0.0195 m for ~17 ticks and then driving through to 0.0000 with the
+ball shooting out sideways.
+
+A cube has form closure. It also moves the task **toward** the pretraining distribution
+rather than away from it: every object in LIBERO's 130 tasks is a box, a can or a cylinder,
+and sec.20's 3/3 on `libero_object` was picking up a rectangular soup carton.
+
+Third, smaller reason: a 40 mm sphere is 16.0 px at the matched agentview. A cube of the
+same width is the same across a face and slightly more across a diagonal, so the pixel
+budget does not get worse.
+
+### 26.2 What this costs
+
+**Every dataset in the repo is now a dataset of a different task.** `a1`-`a7`, the
+converted `a4_smolvla` / `a7_smolvla`, `green_ball_pick`, and every checkpoint trained on
+any of them. That includes ACT ck10000's 5/6 placed — the best result the project has —
+and the 2/10 and 1/10 of sec.25.
+
+None of it was deleted and none of it was reworded. The Modal volume paths keep their
+`green_ball` names on purpose: they hold ball data, and renaming them would make a real
+artifact lie about its contents. New box datasets get new names.
+
+Re-collection is free CPU time, so the cost is wall-clock, not money. The cost that is
+*not* recoverable is that sec.25's comparison table no longer has a live opponent: the
+next box number has nothing to be compared against until at least one policy is retrained.
+
+### 26.3 What changed in the code
+
+- **Scenes** — `scene_libero.xml`, `scene_libero_hand.xml`, `scene_libero_osc.xml`,
+  `scene_pick_place.xml`. Verified by compiling all four: `geom_type == mjGEOM_BOX (6)`,
+  `geom_size == [0.02, 0.02, 0.02]`. Not by reading them, per the rule in sec.22.
+- **The contact params were deliberately NOT retuned.** A cube does not need `condim 4`'s
+  torsional friction. Keeping them holds the box scene one variable away from the ball
+  scene; each XML now says so where the old rationale used to be.
+- **Identifiers** — `BALL_RADIUS` → `BOX_HALF`, `BALL_SAMPLE_*` → `BOX_SAMPLE_*`,
+  `set_ball_radius` → `set_box_half_extent`, `--randomize-ball` → `--randomize-box`,
+  `--ball-radius` → `--box-size` (still a half-extent, so the numeric meaning is
+  unchanged), `build_sim(randomize_ball=, ball_radius=)` → `(randomize_box=, box_half=)`.
+- **`--box-size` now checks the DIAGONAL**, `2·half·√2`, not the face width. A cube at an
+  arbitrary yaw presents up to 56.6 mm where the face presents 40 mm, and after a failed
+  grasp the yaw is arbitrary. A sphere had no such distinction. Verified: `--box-size 0.03`
+  is now refused (60 mm box, 85 mm diagonal, 80 mm hand) where the old face-width test
+  would have accepted it.
+- **Log key** — `ball_radius` → `box_half`. `score_runs.py` reads either, so old ball logs
+  still score correctly; the key that is present is also the only thing in the log format
+  that records which object a run used, which is why they were not collapsed into one name.
+- **The instruction moved to `infra/task_spec.py`** and is imported by
+  `libero_closed_loop.py`, `act_modal.py`, `smolvla_modal.py`, `phase3_closed_loop.py` and
+  `phase4_collect_demos.py`. It was five independent string literals. A prompt that differs
+  between collection and serving does not raise — it silently conditions the policy on
+  something it never trained on, the same failure shape as sec.5's hardcoded `NORM_TAG`.
+
+Incidental fix found on the way: `collect_finetune_data.py --help` crashed with
+`ValueError: unsupported format character` on four unescaped `%` in argparse help strings.
+Pre-existing, unrelated, fixed.
+
+### 26.4 What to expect, stated in advance so it can be wrong
+
+The prediction this change is worth making, before any measurement:
+
+1. **The expert's keep rate should go up**, because rejection sampling is currently
+   deleting episodes where a sphere squirted out of the grasp (sec.23.5).
+2. **Closure should become better correlated with lateral distance**, because a cube that
+   is contacted off-centre gets pushed rather than rolled away.
+3. **The stock-checkpoint baseline should improve at least slightly**, because the object
+   is now the shape LIBERO pretrained on.
+
+If (1) holds and (3) does not, the object shape was never the constraint and sec.25.1's
+diagnosis needs revisiting. If none of them hold, this change bought nothing but a cleaner
+scene, and that should be written down here rather than quietly absorbed.
+
+**Do not read any of this as a result.** Re-collect, retrain, re-score.
+
+---
+
 ## Corrections to `docs/PHASE5_PLAN.md`
 
 Things the plan asserts that later measurement contradicted:

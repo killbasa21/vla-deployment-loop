@@ -1,15 +1,22 @@
-# greenbox — teaching a policy to pick up a green ball
+# greenbox — teaching a policy to pick up a green box
 
 A learning project about the **whole VLA deployment loop**, not about any one model: a
 Franka Panda in MuJoCo on this machine, a policy server on a rented GPU, HTTP in between,
 and a pick-and-place task that has to actually succeed for the loop to count as working.
 
-**The task:** *pick up the green ball and put it in the green container.* Ball and bin
+**The task:** *pick up the green box and put it in the green container.* Box and bin
 positions randomise every episode.
+
+> **The pick target changed on 2026-08-03**, from a 40 mm sphere to a 40 mm cube, and the
+> instruction changed with it. Reason and consequences in
+> [`libero/PROGRESS.md` §26](libero/PROGRESS.md). **Every number on this page was measured
+> on the ball**, as were the `a5`/`a6`/`a7` datasets and every checkpoint trained on them.
+> They are kept because the failure modes they document are still the ones to beat, but no
+> box result can be compared to them without re-measuring.
 
 ```
  ┌──────────── local (this repo) ─────────────┐        ┌──── Modal GPU ────┐
- │ MuJoCo: Franka Panda + green ball + bins   │  HTTP  │ policy server      │
+ │ MuJoCo: Franka Panda + green box + bins    │  HTTP  │ policy server      │
  │  - renders external_cam + wrist_cam        │ ─────► │ POST /act          │
  │  - reads proprioception                    │  JSON  │ in:  images,       │
  │  - applies the returned action chunk       │ ◄───── │      instruction,  │
@@ -21,7 +28,7 @@ positions randomise every episode.
 Four policies have been run through that same loop. The interesting part of the project is
 the *comparison*, and the fact that the winner is the smallest model.
 
-## Status, 2026-08-02
+## Status, 2026-08-03
 
 | track | policy | best measured result | state |
 |---|---|---|---|
@@ -55,7 +62,7 @@ curl -s <url>/health                            # ALWAYS confirm which checkpoin
 # 2. run the closed loop against it
 uv run python libero/libero_closed_loop.py \
     --payload-keys libero --server-url <url>/act \
-    --delta-pos-scale 0.10 --randomize-ball --randomize-bins \
+    --delta-pos-scale 0.10 --randomize-box --randomize-bins \
     --chunks 70 --no-view --run-id act_ck30000_00
 
 # 3. score the run logs
@@ -70,7 +77,7 @@ the server changes. Three flags decide whether the run measures anything:
   and those servers 400 rather than run blind.
 - `--delta-pos-scale` **must equal the value the dataset was collected at** — 0.10 for
   `a7`, 0.20 for `a6`, 0.05 for `a5`. A mismatch does not measure that fine-tune at all.
-- `--randomize-ball --randomize-bins` — every fixed-layout number in the logs predates
+- `--randomize-box --randomize-bins` — every fixed-layout number in the logs predates
   these and is not comparable across them.
 
 Collecting a fresh dataset and training:
@@ -80,6 +87,11 @@ uv run python libero/fine_tune/collect_finetune_data.py --out libero/fine_tune/a
 modal run act/act_modal_train.py::main --max-steps 1 --save-freq 1   # SMOKE FIRST, always
 modal run act/act_modal_train.py::main --max-steps 60000 --save-freq 10000
 ```
+
+Anything collected from 2026-08-03 onward is a **box** dataset — the collector reads the
+target's name, geometry and instruction from the same place the closed loop does, so there
+is no flag to set and no way for the two sides to disagree. `a1`–`a7` are ball datasets and
+stay that way.
 
 ## Repo layout
 
@@ -98,7 +110,8 @@ scripts/          Small operational helpers.
 fine_tunes/       Pulled checkpoints (gitignored except each run's run_info.md).
 assets/           Per-run debug artifacts, grouped by policy:
                   <model>/<fine_tune>/logs/<run_id>.jsonl and .../images/<run_id>/. Gitignored.
-infra/            modal_images.py — every Modal image, defined once.
+infra/            modal_images.py (every Modal image, once) + task_spec.py (the instruction
+                  and the target object, once).
 data/             Locally generated datasets. Gitignored.
 molmoact2/        Vendored reference repo, gitignored, not this project's code.
 mujoco_menagerie/ Vendored reference repo + our scene XMLs. Gitignored — see the warning below.
@@ -238,3 +251,12 @@ what was believed at the time, not as current fact. **Re-measure anything load-b
   ([`act/PROGRESS.md` §7.5](act/PROGRESS.md)). Score intermediate checkpoints.
 - **A run log written by a live run is incomplete.** `score_runs.py` prints `INCOMPLETE`;
   believe it. A truncated log ends mid-carry and scores exactly like a release failure.
+- **The task's instruction string is defined once,** in `infra/task_spec.py`, and imported
+  by the collector, the closed loop and all three servers. It used to be five literals. A
+  prompt that differs between training and serving does not raise — it silently conditions
+  the policy on something it never saw.
+- **The pick target is a 40 mm cube, and has been since 2026-08-03**
+  ([`libero/PROGRESS.md` §26](libero/PROGRESS.md)). It was a 40 mm sphere before that, which
+  is why `score_runs.py` still reads a `ball_radius` key alongside `box_half` — old logs
+  must keep scoring correctly, and that key is the only record in the log format of which
+  object a run used.

@@ -1,5 +1,5 @@
 """
-Phase 4: collect classical (IK-scripted) expert demonstrations of the green-ball
+Phase 4: collect classical (IK-scripted) expert demonstrations of the green-box
 pick-and-place task, recorded in the MolmoAct2-DROID observation/action convention
 and written out as a LeRobot v2.1 dataset for (eventual) VLA fine-tuning.
 
@@ -11,7 +11,7 @@ against the loaded MuJoCo model. The IK is used purely as a *planner*: it solves
 waypoint on a throwaway copy of the sim state to get a target joint configuration, and
 the real sim is then driven toward those configurations by the Panda's position
 actuators, so the actual grasp happens through real contact physics (the fingers close
-on the ball, friction holds it) rather than by teleporting qpos.
+on the box, friction holds it) rather than by teleporting qpos.
 
 Every control tick (~15 Hz, matching DROID) we record, *before* stepping:
   - external_cam + wrist_cam RGB frames (same two cameras phase3 uses),
@@ -20,7 +20,7 @@ Every control tick (~15 Hz, matching DROID) we record, *before* stepping:
     same thing MolmoAct2-DROID's /act endpoint returns, so a model trained on this data
     speaks the same wire format droid/phase3_closed_loop.py already consumes.
 
-Only episodes where the ball ends up resting inside the green container are kept.
+Only episodes where the box ends up resting inside the green container are kept.
 
 Usage:
     # render 1 episode to an mp4, no dataset
@@ -31,14 +31,17 @@ Usage:
 """
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
 import mujoco
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from infra.task_spec import INSTRUCTION  # noqa: E402  shared with libero/, act/, smolvla_libero/
+
 MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_pick_place.xml"
-INSTRUCTION = "pick up the green ball and put it in the green container"
 
 # Gripper conventions. The Panda mounts a Robotiq 2F-85 (see panda.xml). Its
 # fingers_actuator takes ctrl in 0-255 (0=open, 255=closed). MolmoAct2-DROID's gripper
@@ -107,10 +110,10 @@ def build_sim(model_path=MODEL_PATH):
     return model, data
 
 
-def reset_scene(model, data, ball_xy, rng=None, arm_jitter=0.0):
-    """Reset to the home keyframe and (re)place the green ball. The 'home' keyframe
+def reset_scene(model, data, box_xy, rng=None, arm_jitter=0.0):
+    """Reset to the home keyframe and (re)place the green box. The 'home' keyframe
     predates the freejoint props, so mj_resetDataKeyframe zero-pads their qpos to the
-    origin -- we set the ball's freejoint pose by hand (same fix phase3 uses). red_box
+    origin -- we set the box's freejoint pose by hand (same fix phase3 uses). red_box
     is parked off to the side as a static-ish distractor at its own default spot.
 
     arm_jitter (radians): if >0 and rng is given, perturb the 7 arm joints around the
@@ -125,15 +128,17 @@ def reset_scene(model, data, ball_xy, rng=None, arm_jitter=0.0):
             data.qpos[:7] + rng.normal(0.0, arm_jitter, size=7), lower, upper)
         data.ctrl[ARM] = data.qpos[:7]  # hold the jittered pose, don't snap back to home
 
-    # green ball: rest on the floor (center = radius above z=0) at the requested xy.
-    ball_adr = freejoint_qpos_adr(model, "green_ball")
-    data.qpos[ball_adr : ball_adr + 3] = [ball_xy[0], ball_xy[1], 0.02]
-    data.qpos[ball_adr + 3 : ball_adr + 7] = [1, 0, 0, 0]
+    # green box: rest on the floor (centre = half-extent above z=0) at the requested xy.
+    # Named for its colour rather than its shape now that both props are cubes -- calling
+    # either one `box_adr` reads as the other one at a glance.
+    green_adr = freejoint_qpos_adr(model, "green_box")
+    data.qpos[green_adr : green_adr + 3] = [box_xy[0], box_xy[1], 0.02]
+    data.qpos[green_adr + 3 : green_adr + 7] = [1, 0, 0, 0]
 
-    # red_box distractor: keep it in the scene but out of the ball's grasp corridor.
-    box_adr = freejoint_qpos_adr(model, "red_box")
-    data.qpos[box_adr : box_adr + 3] = [0.5, -0.28, 0.02]
-    data.qpos[box_adr + 3 : box_adr + 7] = [1, 0, 0, 0]
+    # red_box distractor: keep it in the scene but out of the target's grasp corridor.
+    red_adr = freejoint_qpos_adr(model, "red_box")
+    data.qpos[red_adr : red_adr + 3] = [0.5, -0.28, 0.02]
+    data.qpos[red_adr + 3 : red_adr + 7] = [1, 0, 0, 0]
 
     mujoco.mj_forward(model, data)
 
@@ -195,23 +200,23 @@ def solve_ik(model, scratch, site_id, target_pos, target_mat, q_seed,
 # Waypoint script -> per-tick joint + gripper targets
 # ---------------------------------------------------------------------------
 
-def plan_episode(model, data, site_id, home_mat, ball_xy, bin_pos):
+def plan_episode(model, data, site_id, home_mat, box_xy, bin_pos):
     """Turn the pick-and-place waypoint script into a list of (q_target[7],
     gripper_rad) control setpoints, one per control tick, by solving IK at each
     waypoint and interpolating joint space between them.
 
     home_mat is the pinch-site orientation at the home keyframe (gripper pointing
     straight down); every waypoint reuses it, so the grasp stays top-down throughout."""
-    ball = np.array([ball_xy[0], ball_xy[1], 0.02])
+    box = np.array([box_xy[0], box_xy[1], 0.02])
     bin_top = np.array([bin_pos[0], bin_pos[1], 0.0])
 
     O, C = GRIPPER_OPEN_RAD, GRIPPER_CLOSED_RAD
     # (target pinch position, gripper_rad, seconds for this segment)
     waypoints = [
-        (ball + [0, 0, 0.14], O, 1.2),   # 1 pre-grasp: hover above ball, open
-        (ball + [0, 0, 0.005], O, 1.0),  # 2 descend onto ball, still open
-        (ball + [0, 0, 0.005], C, 0.8),  # 3 close gripper (arm holds still)
-        (ball + [0, 0, 0.24], C, 1.0),   # 4 lift straight up
+        (box + [0, 0, 0.14], O, 1.2),   # 1 pre-grasp: hover above box, open
+        (box + [0, 0, 0.005], O, 1.0),  # 2 descend onto box, still open
+        (box + [0, 0, 0.005], C, 0.8),  # 3 close gripper (arm holds still)
+        (box + [0, 0, 0.24], C, 1.0),   # 4 lift straight up
         (bin_top + [0, 0, 0.26], C, 1.4),# 5 transport over the container
         (bin_top + [0, 0, 0.12], C, 1.0),# 6 lower into the container
         (bin_top + [0, 0, 0.12], O, 0.7),# 7 release
@@ -260,18 +265,18 @@ def read_state(model, data, driver_qposadr):
 
 
 def run_episode(model, data, renderer, site_id, home_mat, driver_qposadr,
-                ball_xy, bin_pos, decimation, cam_names, record=True):
+                box_xy, bin_pos, decimation, cam_names, record=True):
     """Plan + execute one episode. Returns (frames_dict, states, actions, success)
     where frames_dict maps camera name -> list of (H,W,3) uint8 arrays. When
     record=False, images are still rendered (needed for the preview mp4) but the
     caller decides what to do with them."""
-    setpoints = plan_episode(model, data, site_id, home_mat, ball_xy, bin_pos)
+    setpoints = plan_episode(model, data, site_id, home_mat, box_xy, bin_pos)
     if setpoints is None:
         return None, None, None, False
 
     frames = {c: [] for c in cam_names}
     states, actions = [], []
-    ball_adr = freejoint_qpos_adr(model, "green_ball")
+    box_adr = freejoint_qpos_adr(model, "green_box")
 
     for q_target, grip_rad in setpoints:
         # Observation captured BEFORE applying this tick's action.
@@ -288,10 +293,10 @@ def run_episode(model, data, renderer, site_id, home_mat, driver_qposadr,
         for _ in range(decimation):
             mujoco.mj_step(model, data)
 
-    # Success: ball resting inside the green container footprint (10x10cm, rim ~4cm).
-    ball_pos = data.qpos[ball_adr : ball_adr + 3]
-    dx, dy = ball_pos[0] - bin_pos[0], ball_pos[1] - bin_pos[1]
-    success = abs(dx) < 0.05 and abs(dy) < 0.05 and ball_pos[2] < 0.06
+    # Success: box resting inside the green container footprint (10x10cm, rim ~4cm).
+    box_pos = data.qpos[box_adr : box_adr + 3]
+    dx, dy = box_pos[0] - bin_pos[0], box_pos[1] - bin_pos[1]
+    success = abs(dx) < 0.05 and abs(dy) < 0.05 and box_pos[2] < 0.06
     return frames, np.array(states), np.array(actions), success
 
 
@@ -324,23 +329,23 @@ def main():
     cam_names = ("external_cam", "wrist_cam")
 
     # Capture the gripper-pointing-down orientation from the home keyframe once.
-    reset_scene(model, data, ball_xy=(0.5, 0.0))
+    reset_scene(model, data, box_xy=(0.5, 0.0))
     home_mat = data.site_xmat[site_id].copy()
 
     rng = np.random.default_rng(args.seed)
 
-    def sample_ball_xy():
+    def sample_box_xy():
         # Reachable workspace patch in front of the arm, kept clear of the bins.
         return (rng.uniform(0.40, 0.58), rng.uniform(-0.16, 0.14))
 
     if args.preview:
         import imageio.v2 as imageio
-        ball_xy = sample_ball_xy()
+        box_xy = sample_box_xy()
         bin_pos = randomize_bin_layout(model, bin_ids, rng)
-        reset_scene(model, data, ball_xy, rng=rng, arm_jitter=args.start_jitter)
+        reset_scene(model, data, box_xy, rng=rng, arm_jitter=args.start_jitter)
         frames, states, actions, success = run_episode(
             model, data, renderer, site_id, home_mat, driver_qposadr,
-            ball_xy, bin_pos, decimation, cam_names)
+            box_xy, bin_pos, decimation, cam_names)
         out = Path("assets/phase4_preview.mp4")
         out.parent.mkdir(parents=True, exist_ok=True)
         if frames is None:
@@ -350,8 +355,8 @@ def main():
         combined = [np.concatenate([e, w], axis=1)
                     for e, w in zip(frames["external_cam"], frames["wrist_cam"])]
         imageio.mimsave(out, combined, fps=CONTROL_HZ)
-        print(f"ball_xy={np.round(ball_xy,3)}  success={success}  "
-              f"steps={len(states)}  ball_final_z={data.qpos[freejoint_qpos_adr(model,'green_ball')+2]:.3f}")
+        print(f"box_xy={np.round(box_xy,3)}  success={success}  "
+              f"steps={len(states)}  box_final_z={data.qpos[freejoint_qpos_adr(model,'green_box')+2]:.3f}")
         print(f"wrote {out}  (external | wrist, {len(combined)} frames @ {CONTROL_HZ} fps)")
         renderer.close()
         return
@@ -374,18 +379,18 @@ def main():
     t0 = time.time()
     while kept < args.episodes and attempts < max_attempts:
         attempts += 1
-        ball_xy = sample_ball_xy()
+        box_xy = sample_box_xy()
         bin_pos = randomize_bin_layout(model, bin_ids, rng)
-        reset_scene(model, data, ball_xy, rng=rng, arm_jitter=args.start_jitter)
+        reset_scene(model, data, box_xy, rng=rng, arm_jitter=args.start_jitter)
         frames, states, actions, success = run_episode(
             model, data, renderer, site_id, home_mat, driver_qposadr,
-            ball_xy, bin_pos, decimation, cam_names)
+            box_xy, bin_pos, decimation, cam_names)
         if not success:
             continue
         writer.add_episode(frames, states, actions, task=INSTRUCTION)
         kept += 1
         print(f"[{kept}/{args.episodes}] attempt {attempts}  "
-              f"ball_xy={np.round(ball_xy,3)}  bin_pos={np.round(bin_pos,3)}  steps={len(states)}")
+              f"box_xy={np.round(box_xy,3)}  bin_pos={np.round(bin_pos,3)}  steps={len(states)}")
 
     writer.finalize()
     renderer.close()

@@ -1,4 +1,4 @@
-"""Collect scripted expert demonstrations of the green-ball pick-and-place task, in the
+"""Collect scripted expert demonstrations of the green-box pick-and-place task, in the
 **LIBERO** convention, for LoRA + action-expert fine-tuning of MolmoAct2-LIBERO.
 
 Not to be confused with `droid/phase4_collect_demos.py` at the repo root. That one records the
@@ -49,7 +49,7 @@ re-measured, not carried over -- see docs/SERVO_DROOP.md sec.4.3 for how that sw
 
 THE THREE COHORTS
 -----------------
-  reach   (20)  Nominal. Randomised ball position and bin layout, LIBERO's reset pose.
+  reach   (20)  Nominal. Randomised box position and bin layout, LIBERO's reset pose.
   noise   (20)  DART-style noise injection. Gaussian noise is added to the EXECUTED
                 action, but the recorded label is the clean expert action AT THE STATE
                 THE NOISE PRODUCED. This is what teaches recovery: the model sees
@@ -90,8 +90,12 @@ INSTRUCTION = L.INSTRUCTION
 # Gripper command in the LIBERO action space. -1 = open, +1 = closed.
 OPEN, CLOSED = L.GRIPPER_ACTION_OPEN, L.GRIPPER_ACTION_CLOSED
 
-BALL_RADIUS = 0.02
-BALL_REST_Z = L.TABLE_TOP_Z + BALL_RADIUS
+# Half-extent of the 40 mm pick cube. Taken from libero_closed_loop rather than restated,
+# because the collector's resting height and the scorer's lift threshold have to move
+# together -- they were separate 0.02 literals until 2026-08-03 and nothing would have
+# caught them diverging.
+BOX_HALF = L.BOX_HALF
+BOX_REST_Z = L.TABLE_TOP_Z + BOX_HALF
 
 # Bin anchor slots, read off scene_libero_hand.xml. Which colour sits at which slot is
 # shuffled per episode so the model has to LOOK for the green one rather than memorise a
@@ -108,7 +112,7 @@ BIN_NAMES = L.BIN_NAMES
 # meaningfully off the reference without making the task unachievable -- the released
 # LIBERO actions have a per-channel std around 0.33, so this is a visible but minority
 # perturbation. The gripper channel is deliberately NOT perturbed: flipping it mid-grasp
-# does not produce a recoverable state, it produces a dropped ball.
+# does not produce a recoverable state, it produces a dropped box.
 #
 # 2026-07-28: 0.15 -> 0.08 (and rot 0.04 -> 0.021, holding the same 0.267 ratio).
 #
@@ -135,6 +139,83 @@ BIN_NAMES = L.BIN_NAMES
 # filling every slot near-certain rather than merely likely.
 NOISE_SIGMA_POS = 0.08
 NOISE_SIGMA_ROT = 0.021
+
+# --- drift cohort (2026-08-03, for the box datasets) --------------------------------
+# A third way of perturbing, between `noise` (every tick, so the arm is never on the
+# reference) and `recover` (a single-tick impulse, so the excursion arrives faster than
+# anything physical would produce it).
+#
+# `drift` picks a few WINDOWS of consecutive ticks and applies the noise-cohort Gaussian
+# inside them only. Outside a window the executed action is the clean expert action, so
+# the arm is genuinely tracking the reference and the model sees what on-trajectory looks
+# like -- which the `noise` cohort never shows it. Inside a window the perturbation
+# COMPOUNDS over 8-20 ticks into a several-cm excursion, which one tick of the same sigma
+# cannot do (0.47 * 0.05 m * 0.123 realised = 2.9 mm for a single tick).
+#
+# The label is the clean expert action throughout, exactly as in `noise` -- see sec.4.1.
+# The gripper channel is not perturbed, for the same reason it is not perturbed there.
+DRIFT_WINDOWS = (3, 3)          # inclusive: how many noise bursts per episode
+DRIFT_WINDOW_TICKS = (8, 20)    # inclusive: length of each burst, in control ticks
+# Minimum clear ticks between two windows. Windows are placed at random, so without this
+# three draws can overlap and merge into one longer burst -- the episode would then be
+# labelled "3 drifts" while containing one. At ~14 ticks mean length in a ~410-tick
+# episode two draws collide maybe 10% of the time, so this is not a hot path; the gap also
+# guarantees the arm gets back onto the reference between excursions, which is the part
+# that makes them separate recovery examples rather than one long one.
+DRIFT_MIN_GAP = 15
+
+# --- decoy cohort ------------------------------------------------------------------
+# The deterministic counterpart of `drift`, and the one the box datasets use. Inside a
+# window the EXECUTED action points at a decoy target offset from the reference, so the arm
+# visibly moves the wrong way; the LABEL still points at the true reference, so every frame
+# of the excursion is annotated "you are off, come back".
+#
+# The distinction that matters: putting the wrong move in `waypoints` instead would make it
+# part of the reference, and the label would then say "move wrong" -- the policy would learn
+# to detour and correct, reproducing both halves, because both were labelled as correct.
+# Same argument as sec.4.1 makes for the noise cohort. The wrong move belongs in the
+# execution and nowhere else.
+#
+# 35 mm, not more: the corrective label peaks at DECOY_OFFSET / DELTA_POS_SCALE once the
+# arm has reached the decoy, i.e. 0.70 at LIBERO's 0.05 m/unit. At 50 mm that is exactly
+# 1.0 and the label clips at the moment it carries the most information.
+DECOY_OFFSET = 0.035
+
+
+def _sample_windows(rng, track):
+    """Non-overlapping perturbation windows, all ending before the box is released.
+
+    Windows stop at the RELEASE. Everything after it -- the gripper opening, the rise clear
+    of the bin, the return to the start pose -- happens with the box already placed, so a
+    perturbation there pushes an arm that has nothing left to do and produces recovery
+    labels for a state the task is already finished in.
+
+    The cutoff is derived from the track rather than from a fixed episode fraction: the
+    release is waypoint 11, and how many ticks precede it depends on the box and bin
+    positions, --motion-speed and --no-backoff. Any hardcoded fraction would go stale the
+    moment one of those changed. The last tick at exactly GRIPPER_ACTION_CLOSED is the tick
+    before the open ramp begins.
+
+    Each window is rejection-sampled against the ones already placed so they stay
+    DRIFT_MIN_GAP apart -- see DRIFT_MIN_GAP for why merging them is not the same thing as
+    having them. If a window cannot be placed, fewer are returned than requested, which is
+    visible in the per-episode log line rather than silently merged.
+    """
+    closed = np.flatnonzero(
+        np.array([g for _, g in track]) >= L.GRIPPER_ACTION_CLOSED - 1e-9)
+    end = int(closed[-1]) + 1 if closed.size else len(track)
+    spans = []
+    for _ in range(int(rng.integers(DRIFT_WINDOWS[0], DRIFT_WINDOWS[1] + 1))):
+        for _try in range(50):
+            length = int(rng.integers(DRIFT_WINDOW_TICKS[0], DRIFT_WINDOW_TICKS[1] + 1))
+            start = int(rng.integers(0, max(1, end - length)))
+            if all(start >= b + DRIFT_MIN_GAP or start + length + DRIFT_MIN_GAP <= a
+                   for a, b in spans):
+                break
+        else:
+            continue
+        spans.append((start, min(start + length, end)))
+    return sorted(spans)
 
 # ---- OSC-plant defaults -----------------------------------------------------------
 # Everything above this line was measured on the ik plant. OSC is a different plant and
@@ -169,7 +250,7 @@ DWELL_DIST = 1e-3
 MIN_MOTION_SECS = 0.25
 # Fraction of the label ceiling the default target speed aims at. Smoothstep PEAKS at 1.5x
 # its mean, so the mean budget is v_max/1.5, and the arm needs headroom above the nominal
-# geometry this was computed on -- a ball at the near edge of BALL_SAMPLE_X and a bin at
+# geometry this was computed on -- a box at the near edge of BOX_SAMPLE_X and a bin at
 # the far slot is a longer transport than the nominal 0.252 m.
 MOTION_SPEED_HEADROOM = 0.90
 # The plant constant everything above keys off: OSC realises this fraction of a commanded
@@ -185,16 +266,16 @@ SMOOTHSTEP_PEAK = 1.5   # a smoothstep segment's peak velocity over its mean
 # absorbed the disturbance without the cohort teaching much. A single kick during the
 # approach has 100+ ticks left to wash out and an empty gripper, so nothing is at stake.
 #
-# a3 kicks TWICE, and the second one is the point: it lands mid-transport with the ball
+# a3 kicks TWICE, and the second one is the point: it lands mid-transport with the box
 # actually in the hand, which is where the observed closed-loop failures live (PROGRESS
 # sec.18 -- grasp achieved, retention not, run degenerates from chunk 5). A loaded kick can
-# genuinely drop the ball, and rejection sampling then throws that episode away, so this
+# genuinely drop the box, and rejection sampling then throws that episode away, so this
 # costs attempts -- which is the honest sign that the disturbance is doing work now.
-# The loaded kick is smaller (0.6) than the free one deliberately: at 0.85 with a ball in
+# The loaded kick is smaller (0.6) than the free one deliberately: at 0.85 with a box in
 # the gripper almost every episode fails and the cohort collects nothing.
 RECOVER_START_JITTER = 0.09   # radians, per joint, on top of LIBERO's reset pose
 RECOVER_KICK = 0.85           # free-arm disturbance during the approach, near full scale
-RECOVER_KICK_LOADED = 0.60    # smaller: fired mid-transport, with the ball in the gripper
+RECOVER_KICK_LOADED = 0.60    # smaller: fired mid-transport, with the box in the gripper
 # Fractions of the episode. Re-derived for a4's longer trajectory (10.8 s vs 7.6 s): the
 # gripper closes at 3.8 s and opens again at 9.2 s, i.e. the arm is LOADED over fraction
 # 0.35-0.85, so the free-arm window has to end before 0.35 and the loaded one has to sit
@@ -206,16 +287,16 @@ RECOVER_KICK_WINDOWS = ((0.06, 0.33), (0.45, 0.78))
 # a3's dx channel is ONE-SIDED: q01 = -0.072 against the released dataset's -0.679, i.e.
 # over the whole dataset there is essentially no label that says "move back in -x". That is
 # exactly the correction the closed-loop failures need (README sec.6.5, sec.6.6): the arm
-# overshoots past the ball and never comes back. Noise sigma cannot buy this -- raising it
+# overshoots past the box and never comes back. Noise sigma cannot buy this -- raising it
 # past ~0.09 simply stops episodes from succeeding (sec.4.3) -- so the -x motion has to come
 # from the EXPERT trajectory itself, where it is labelled unconditionally and survives
 # rejection sampling by construction.
 #
 # Two segments are added:
 #   (a) a back-off-and-re-approach inserted between the hover and the descent. The arm
-#       arrives above the ball, withdraws toward the base, then comes back in. This is the
+#       arrives above the box, withdraws toward the base, then comes back in. This is the
 #       recovery manoeuvre we want the policy to have, demonstrated in the exact visual
-#       context (ball centred, gripper open) where it will need it.
+#       context (box centred, gripper open) where it will need it.
 #   (b) a return to the episode's own start pose after the release, replacing a3's "rise
 #       20 cm and stop". Bins sit at x = 0.56 or 0.80 and the reset pose at x ~ 0.45, so
 #       this is -0.11 to -0.35 m of travel in -x, and it is what a real demonstration would
@@ -240,7 +321,7 @@ def bin_layout(model, bin_ids, rng, mode="shuffle", scene_xy=None):
     "shuffle" (a1-a5) permutes the three bins across the three slots with +-2 cm of
     jitter, so the policy has to resolve "green" by colour rather than by memorised
     position. That is the general skill -- but the closed loop NEVER randomises bins
-    (libero_closed_loop.py has --randomize-ball and no bin equivalent), so every
+    (libero_closed_loop.py has --randomize-box and no bin equivalent), so every
     evaluation runs the one layout the scene XML declares, green at (0.56, 0.25). In a5
     that layout drew only 6 of 30 episodes; the other 24 taught reaching toward bins that
     are not there at inference.
@@ -270,8 +351,8 @@ def bin_layout(model, bin_ids, rng, mode="shuffle", scene_xy=None):
     return green_xy
 
 
-def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0, osc=None):
-    """LIBERO's reset pose, plus this episode's ball and bin layout, settled.
+def reset_episode(model, data, rng, box_xy, arm_jitter=0.0, osc=None):
+    """LIBERO's reset pose, plus this episode's box and bin layout, settled.
 
     `osc` is the OSCController in --control-mode osc, None in ik mode. It changes two
     things, both mirroring `L.build_sim`:
@@ -295,8 +376,8 @@ def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0, osc=None):
         data.ctrl[L.ARM] = 0.0
     data.ctrl[7] = L.GRIPPER_CTRL_MAX  # open
 
-    for name, pos in [("green_ball", (ball_xy[0], ball_xy[1], BALL_REST_Z)),
-                      ("red_box", (0.56, -0.28, BALL_REST_Z))]:
+    for name, pos in [(L.TARGET_BODY, (box_xy[0], box_xy[1], BOX_REST_Z)),
+                      ("red_box", (0.56, -0.28, BOX_REST_Z))]:
         bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
         if bid == -1:
             continue
@@ -327,17 +408,24 @@ def reset_episode(model, data, rng, ball_xy, arm_jitter=0.0, osc=None):
         osc.initial_joint = L.LIBERO_INIT_QPOS.copy()
 
 
-def waypoints(ball_xy, bin_xy, start_pos):
+def waypoints(box_xy, bin_xy, start_pos, backoff=True):
     """The Cartesian reference trajectory, as (grip_site target, gripper, seconds).
 
     `start_pos` is the arm's ACTUAL settled pose at reset (jittered, for the recover
     cohort), used as the target of the closing retreat so the episode ends where it began.
 
-    Heights are relative to the ball and the table, both of which moved on 2026-07-28 when
-    the table was corrected upward by 100 mm -- so they are written in terms of
-    BALL_REST_Z / TABLE_TOP_Z rather than as literals.
+    `backoff=False` drops segments 1a/1b/1c, the withdraw-and-re-approach inserted between
+    the hover and the descent. Those exist to put -x motion in the labels (see
+    RETREAT_BACKOFF), and dropping them makes the approach a single clean descent at the
+    cost of thinning the -x distribution. The closing return to `start_pos` (segment 13) is
+    NOT dropped with it and is then the only -x source left, which is why it stays: a3 had
+    neither and its dx q01 was -0.072 against released LIBERO's -0.679.
 
-    The grasp target is the ball CENTRE, not some offset above it. That only became the
+    Heights are relative to the box and the table, both of which moved on 2026-07-28 when
+    the table was corrected upward by 100 mm -- so they are written in terms of
+    BOX_REST_Z / TABLE_TOP_Z rather than as literals.
+
+    The grasp target is the box CENTRE, not some offset above it. That only became the
     right answer once `grip_site` was moved to robosuite's literal 0.097: the site is now
     robosuite's own grasp point, so aiming it at the object centre is exactly what LIBERO's
     demonstrations do. Under the old 0.1065 site the same command would have driven the
@@ -347,24 +435,27 @@ def waypoints(ball_xy, bin_xy, start_pos):
     They are not padding. The arm is a position servo with roughly 330 ms of settling
     (PHASE5_PLAN corrections), so a waypoint reached in the plan is NOT a waypoint reached
     by the hardware. Without a dwell the gripper opens while the arm is still 1-2 cm short
-    of the bin and travelling, and the ball is thrown rather than placed -- which is
+    of the bin and travelling, and the box is thrown rather than placed -- which is
     exactly what the first calibration run did: 12/15 grasps but only 5/15 placements."""
-    bx, by = ball_xy
+    bx, by = box_xy
     gx, gy = bin_xy
-    ball = np.array([bx, by, BALL_REST_Z])
+    box = np.array([bx, by, BOX_REST_Z])
     over_bin = np.array([gx, gy, L.TABLE_TOP_Z])
-    hover = ball + [0, 0, 0.10]
-    backoff = hover + [-RETREAT_BACKOFF, 0, RETREAT_BACKOFF_LIFT]
-    return [
-        (hover, OPEN, 1.0),                  # 1  hover above the ball, gripper open
-        (backoff, OPEN, RETREAT_BACKOFF_SECS),  # 1a withdraw toward the base -- see
-        (hover, OPEN, RETREAT_BACKOFF_SECS),    # 1b RETREAT_BACKOFF: the -x labels
+    hover = box + [0, 0, 0.10]
+    backoff_pos = hover + [-RETREAT_BACKOFF, 0, RETREAT_BACKOFF_LIFT]
+    retreat = [
+        (backoff_pos, OPEN, RETREAT_BACKOFF_SECS),  # 1a withdraw toward the base -- see
+        (hover, OPEN, RETREAT_BACKOFF_SECS),        # 1b RETREAT_BACKOFF: the -x labels
         (hover, OPEN, 0.2),                  # 1c dwell: let the re-approach settle
-        (ball, OPEN, 0.8),                   # 2  descend onto it
-        (ball, OPEN, 0.3),                   # 3  dwell: let the servo actually arrive
-        (ball, CLOSED, 0.6),                 # 4  close, arm holding station
-        (ball, CLOSED, 0.4),                 # 5  dwell: let the grasp seat before loading it
-        (ball + [0, 0, 0.15], CLOSED, 1.0),  # 6  lift clear of the table
+    ] if backoff else []
+    return [
+        (hover, OPEN, 1.0),                  # 1  hover above the box, gripper open
+        *retreat,
+        (box, OPEN, 0.8),                   # 2  descend onto it
+        (box, OPEN, 0.3),                   # 3  dwell: let the servo actually arrive
+        (box, CLOSED, 0.6),                 # 4  close, arm holding station
+        (box, CLOSED, 0.4),                 # 5  dwell: let the grasp seat before loading it
+        (box + [0, 0, 0.15], CLOSED, 1.0),  # 6  lift clear of the table
         (over_bin + [0, 0, 0.20], CLOSED, 2.0),  # 7  transport
         (over_bin + [0, 0, 0.20], CLOSED, 0.4),  # 8  dwell: kill the lateral overshoot
         (over_bin + [0, 0, 0.07], CLOSED, 0.8),  # 9  lower to just above the rim
@@ -375,8 +466,8 @@ def waypoints(ball_xy, bin_xy, start_pos):
     ]
 
 
-def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_scale=1.0,
-                    motion_speed=None):
+def reference_track(model, data, site_id, box_xy, bin_xy, control_hz, speed_scale=1.0,
+                    motion_speed=None, backoff=True):
     """Expand the waypoints into one (target_pos, gripper) per control tick.
 
     `speed_scale` multiplies every segment DURATION, so >1 makes the reference slower. It
@@ -394,7 +485,7 @@ def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_sca
     matter how far off the reference actually is.
 
     Slowing the reference is the correct lever rather than shrinking the waypoints: the
-    geometry (where the ball is, how high to lift) is task-defined, the timing is not.
+    geometry (where the box is, how high to lift) is task-defined, the timing is not.
     Solving label <= 1 for v gives v <= DELTA_POS_SCALE * realised / dt = 0.123 m/s, which
     the ik-era timings exceed on the retreat (0.27 m/s) and the transport (~0.15 m/s).
 
@@ -403,8 +494,8 @@ def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_sca
 
     Interpolation is a SMOOTHSTEP (3a^2 - 2a^3), not linear. Linear segments meet at a
     velocity discontinuity: the reference jumps from full speed to zero (or to a new
-    direction) in one tick, the arm follows with a jerk, and the ball is shaken out of a
-    friction grasp. That is what the first two calibration runs were doing -- the ball was
+    direction) in one tick, the arm follows with a jerk, and the box is shaken out of a
+    friction grasp. That is what the first two calibration runs were doing -- the box was
     lifted to exactly the commanded height every time and then dropped 0.10-0.12 m short of
     the bin, mid-transport. Smoothstep has zero derivative at both ends of every segment,
     so the reference accelerates and decelerates instead of stepping."""
@@ -412,7 +503,7 @@ def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_sca
     track = []
     prev_pos = data.site_xpos[site_id].copy()
     prev_grip = OPEN
-    for target, grip, dur in waypoints(ball_xy, bin_xy, prev_pos):
+    for target, grip, dur in waypoints(box_xy, bin_xy, prev_pos, backoff=backoff):
         dist = float(np.linalg.norm(np.asarray(target, dtype=float) - prev_pos))
         if motion_speed is not None and dist > DWELL_DIST:
             # Retime by DISTANCE instead of using the hand-set duration. The hand-set
@@ -424,7 +515,7 @@ def reference_track(model, data, site_id, ball_xy, bin_xy, control_hz, speed_sca
             #
             # The floor is not cosmetic. A short segment retimed to a couple of ticks is a
             # near-step in the reference, which is the velocity discontinuity smoothstep
-            # exists to avoid (below) -- and that discontinuity is what shook the ball out
+            # exists to avoid (below) -- and that discontinuity is what shook the box out
             # of the grasp in the early calibration runs.
             dur = max(MIN_MOTION_SECS, dist / motion_speed)
         n = max(1, int(round(dur * speed_scale / dt)))
@@ -456,20 +547,21 @@ def expert_action(data, site_id, target_pos, target_mat, grip):
     return a
 
 
-def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_body,
-                rng, cohort, control_hz, decimation, ball_xy, bin_xy, osc=None,
-                speed_scale=1.0, motion_speed=None):
+def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, box_body,
+                rng, cohort, control_hz, decimation, box_xy, bin_xy, osc=None,
+                speed_scale=1.0, motion_speed=None, backoff=True):
     """Execute one demonstration. Returns (frames, states, actions, info)."""
     arm_jitter = RECOVER_START_JITTER if cohort == "recover" else 0.0
-    reset_episode(model, data, rng, ball_xy, arm_jitter=arm_jitter, osc=osc)
+    reset_episode(model, data, rng, box_xy, arm_jitter=arm_jitter, osc=osc)
 
     # Hold the reset orientation throughout: measured against a live LIBERO env, our
     # grip_site at LIBERO's reset joints has axis-angle (3.140, 0, -0.089) against
     # LIBERO's own (3.141, 0.002, -0.090). Top-down, and already in distribution.
     target_mat = data.site_xmat[site_id].copy()
 
-    track = reference_track(model, data, site_id, ball_xy, bin_xy, control_hz,
-                            speed_scale=speed_scale, motion_speed=motion_speed)
+    track = reference_track(model, data, site_id, box_xy, bin_xy, control_hz,
+                            speed_scale=speed_scale, motion_speed=motion_speed,
+                            backoff=backoff)
 
     # Recovery cohort: two shoves, one free-armed during the approach and one loaded
     # during the transport. See RECOVER_KICK_WINDOWS.
@@ -479,12 +571,42 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
             t = int(rng.integers(max(1, int(lo * len(track))), max(2, int(hi * len(track)))))
             kicks[t] = mag
 
+    # Perturbation windows, shared by the `drift` and `decoy` cohorts -- they differ only
+    # in WHAT is executed inside a window, not in where the windows go.
+    drift_ticks, drift_spans, decoy_offsets = set(), [], {}
+    if cohort in ("drift", "decoy"):
+        spans = _sample_windows(rng, track)
+        drift_spans = spans
+        if cohort == "drift":
+            for a, b in spans:
+                drift_ticks.update(range(a, b))
+        else:
+            # One offset direction per window, held for the whole window, so the excursion
+            # accumulates in a straight line instead of averaging back to zero. Magnitude
+            # is fixed: DECOY_OFFSET / DELTA_POS_SCALE is the label the corrective action
+            # reaches once the arm has actually arrived at the decoy, so it sets how large
+            # a correction the cohort teaches -- and it must stay under 1.0 or the label
+            # clips at exactly the moment the recovery signal is strongest.
+            for a, b in spans:
+                d = rng.normal(size=3)
+                d /= np.linalg.norm(d)
+                for t in range(a, b):
+                    decoy_offsets[t] = DECOY_OFFSET * d
+
     frames = {"image": [], "wrist_image": []}
     states, actions = [], []
     clamped_ticks = 0
     saturated_steps = 0   # OSC's failure signal, the analogue of ik mode's "IK unreached"
-    ball_adr = model.jnt_qposadr[model.body_jntadr[ball_body]]
-    max_ball_z = -np.inf
+    # Per-PHYSICS-STEP torque bookkeeping. An episode-wide FRACTION is not enough: three
+    # saturated steps out of 70k is 0.004%, which passes any sane fraction gate, and three
+    # CONSECUTIVE saturated steps on one joint is a controller that lost authority for 6 ms.
+    # These two catch the localised burst the fraction averages away.
+    peak_torque_frac = 0.0      # max over every step and joint of |tau| / limit, pre-clip
+    max_sat_run = 0             # longest unbroken run of steps with any joint saturated
+    sat_run = 0
+    peak_torque_tick = -1       # which control tick the peak landed on, for the log
+    box_adr = model.jnt_qposadr[model.body_jntadr[box_body]]
+    max_box_z = -np.inf
 
     for tick, (target_pos, grip) in enumerate(track):
         # Observation BEFORE the action, matching how the policy is queried at inference.
@@ -497,7 +619,12 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
         actions.append(action.astype(np.float32))
 
         executed = action.copy()
-        if cohort == "noise":
+        if tick in decoy_offsets:
+            # Drive at the DECOY. `action` -- already appended above -- stays the delta to
+            # the TRUE reference, so the label is the correction for wherever this puts us.
+            executed = expert_action(data, site_id, target_pos + decoy_offsets[tick],
+                                     target_mat, grip)
+        elif cohort == "noise" or tick in drift_ticks:
             executed[0:3] += rng.normal(0.0, NOISE_SIGMA_POS, size=3)
             executed[3:6] += rng.normal(0.0, NOISE_SIGMA_ROT, size=3)
         elif tick in kicks:
@@ -527,23 +654,40 @@ def run_episode(model, data, scratch, renderer, site_id, finger_qposadr, ball_bo
                 # the same name would silently break the one comparison worth making --
                 # "did the demos need torques the policy also needs".
                 saturated_steps += int(osc.last_saturated)
+                if osc.last_peak_frac > peak_torque_frac:
+                    peak_torque_frac = osc.last_peak_frac
+                    peak_torque_tick = tick
+                sat_run = sat_run + 1 if osc.last_saturated else 0
+                max_sat_run = max(max_sat_run, sat_run)
             mujoco.mj_step(model, data)
-        max_ball_z = max(max_ball_z, float(data.qpos[ball_adr + 2]))
+        max_box_z = max(max_box_z, float(data.qpos[box_adr + 2]))
 
-    ball = data.qpos[ball_adr:ball_adr + 3].copy()
-    lifted = max_ball_z > BALL_REST_Z + 0.05
-    placed = (abs(ball[0] - bin_xy[0]) < 0.05 and abs(ball[1] - bin_xy[1]) < 0.05
-              and ball[2] < L.TABLE_TOP_Z + 0.06)
+    box = data.qpos[box_adr:box_adr + 3].copy()
+    lifted = max_box_z > BOX_REST_Z + 0.05
+    placed = (abs(box[0] - bin_xy[0]) < 0.05 and abs(box[1] - bin_xy[1]) < 0.05
+              and box[2] < L.TABLE_TOP_Z + 0.06)
     info = {
         "lifted": bool(lifted),
         "placed": bool(placed),
-        "ball_final": ball.tolist(),
-        "ball_max_z": max_ball_z,
+        "box_final": box.tolist(),
+        "box_max_z": max_box_z,
         "table_clamped_ticks": clamped_ticks,
         "osc_saturated_steps": saturated_steps,
         "ticks": len(track),
         "kick_ticks": sorted(int(t) for t in kicks),
-        "ball_xy": [float(ball_xy[0]), float(ball_xy[1])],
+        "drift_spans": [[int(a), int(b)] for a, b in drift_spans],
+        "drift_ticks": len(drift_ticks),
+        # Fraction of joint-steps whose commanded torque hit the actuator ctrlrange. Not
+        # merely diagnostic: --max-saturated-frac rejects on it. A demonstration that only
+        # succeeded by asking for torque the arm cannot deliver is teaching the policy to
+        # ask for it too, and the policy has no such escape hatch at inference.
+        "saturated_frac": (saturated_steps / (len(track) * decimation * 7)
+                           if osc is not None and len(track) else 0.0),
+        "saturated_steps": saturated_steps,
+        "peak_torque_frac": peak_torque_frac,
+        "peak_torque_tick": peak_torque_tick,
+        "max_sat_run": max_sat_run,
+        "box_xy": [float(box_xy[0]), float(box_xy[1])],
         "bin_xy": [float(bin_xy[0]), float(bin_xy[1])],
     }
     return frames, np.array(states), np.array(actions), info
@@ -606,6 +750,68 @@ def main():
     p.add_argument("--reach", type=int, default=20)
     p.add_argument("--noise", type=int, default=20)
     p.add_argument("--recover", type=int, default=10)
+    p.add_argument(
+        "--drift", type=int, default=0,
+        help=(
+            f"episodes in the `drift` cohort: {DRIFT_WINDOWS[0]}-{DRIFT_WINDOWS[1]} random "
+            f"WINDOWS of {DRIFT_WINDOW_TICKS[0]}-{DRIFT_WINDOW_TICKS[1]} ticks each, with "
+            "the noise-cohort Gaussian applied inside them and the clean expert action "
+            "outside. Between `noise` (perturbed every tick, so the arm is never on the "
+            "reference) and `recover` (a single-tick impulse). Uses --noise-sigma-pos/rot"
+        ),
+    )
+    p.add_argument(
+        "--decoy", type=int, default=0,
+        help=(
+            f"episodes in the `decoy` cohort: same windows as --drift, but inside them the "
+            f"EXECUTED action points at a target {DECOY_OFFSET * 1000:.0f} mm off the "
+            "reference in a fixed random direction, so the arm deliberately moves wrong and "
+            "then recovers. The LABEL always points at the true reference. Deterministic "
+            "where --drift is stochastic. Do NOT get this by editing `waypoints` instead -- "
+            "that puts the wrong move in the reference and labels it as correct"
+        ),
+    )
+    p.add_argument(
+        "--no-backoff", action="store_true",
+        help=(
+            "drop the withdraw-and-re-approach segments (1a/1b/1c) between the hover and "
+            "the descent, making the approach one clean descent. Those segments exist to "
+            "put -x motion in the labels (see RETREAT_BACKOFF); the closing return to the "
+            "start pose is kept and becomes the only -x source, so check dx q01 against "
+            "released LIBERO's -0.679 before trusting a dataset collected with this"
+        ),
+    )
+    p.add_argument(
+        "--max-saturated-frac", type=float, default=None, metavar="F",
+        help=(
+            "reject an episode whose commanded torque hit the actuator ctrlrange on more "
+            "than this fraction of joint-steps (denominator ticks * decimation * 7). OSC "
+            "mode only. Off by default, which is how a1-a7 were collected: saturation was "
+            "recorded in the episode metadata but never gated on. Measured at "
+            "--delta-pos-scale 0.05 with clean cohorts: 0.000%%. 0.002 is a sane setting"
+        ),
+    )
+    p.add_argument(
+        "--max-torque-frac", type=float, default=None, metavar="F",
+        help=(
+            "reject an episode in which ANY joint at ANY physics step demanded more than "
+            "this fraction of its actuator limit, measured BEFORE the clip. This is the "
+            "every-point check: --max-saturated-frac is an episode average and a burst of "
+            "a few steps in ~70k disappears into it. Measured at --delta-pos-scale 0.05: "
+            "peak 0.73 of limit (j2, holding the arm against gravity), and the decoy "
+            "windows peak LOWER than the rest of the episode. 0.95 leaves real headroom "
+            "while still catching anything approaching the rail"
+        ),
+    )
+    p.add_argument(
+        "--max-sat-run", type=int, default=None, metavar="N",
+        help=(
+            "reject an episode with more than N CONSECUTIVE physics steps in which any "
+            "joint was saturated. Catches a joint that lost authority for a stretch, which "
+            "neither the average nor a single-step peak distinguishes from isolated "
+            "clipping. 0 means no run at all is tolerated"
+        ),
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--render-size", type=int, default=L.RENDER_HEIGHT)
     p.add_argument("--control-hz", type=float, default=L.CONTROL_HZ)
@@ -636,10 +842,10 @@ def main():
         ),
     )
     p.add_argument("--max-attempts-per-episode", type=int, default=8,
-                   help="rejection sampling budget; an episode that never lifts the ball "
+                   help="rejection sampling budget; an episode that never lifts the box "
                         "is resampled rather than kept")
     p.add_argument("--keep-unplaced", action="store_true",
-                   help="accept episodes that lift the ball but miss the bin. Off by "
+                   help="accept episodes that lift the box but miss the bin. Off by "
                         "default: a demonstration that fails the task is a demonstration "
                         "of failing the task")
     p.add_argument(
@@ -649,9 +855,10 @@ def main():
             f"cohort (default {NOISE_SIGMA_POS}). This is plant-dependent and must be "
             "recalibrated whenever the controller changes: sigma perturbs the COMMANDED "
             "action, but what knocks the arm off the reference is the fraction that gets "
-            "REALISED -- 72% per tick for the retuned position servo a3/a4 were collected "
-            "on, 12.3% for OSC. Carrying a sigma across that change silently changes the "
-            "physical disturbance by ~6x. See docs/SERVO_DROOP.md sec.4.3 for the sweep that set 0.08"
+            "REALISED -- 72%% per tick for the retuned position servo a3/a4 were collected "
+            "on, 12.3%% for OSC. Carrying a sigma across that change silently changes the "
+            "physical disturbance by ~6x. See docs/SERVO_DROOP.md sec.4.3 for the sweep "
+            "that set 0.08"
         ),
     )
     p.add_argument(
@@ -674,8 +881,8 @@ def main():
             "addresses, and usually the better one. The label ceiling is "
             "v <= DELTA_POS_SCALE * realised / dt, so raising the scale raises the arm's "
             "top speed instead of lowering the expert's. a5 took the --speed-scale route "
-            "and produced 27 s / 539-tick episodes that STILL clip dx on 3.07% of frames; "
-            f"--delta-pos-scale {L.FINE_TUNE_DELTA_POS_SCALE} clips 0.93% at the original "
+            "and produced 27 s / 539-tick episodes that STILL clip dx on 3.07%% of frames; "
+            f"--delta-pos-scale {L.FINE_TUNE_DELTA_POS_SCALE} clips 0.93%% at the original "
             "10.8 s. SmolVLA normalises actions MEAN_STD from the "
             "dataset's own stats, so the unit itself is invisible to training. THE SERVING "
             "CLIENT MUST PASS THE SAME VALUE (libero_closed_loop.py --delta-pos-scale); "
@@ -722,12 +929,38 @@ def main():
     # near-100% first-attempt keeps, which reads as success while teaching nothing.
     L.set_delta_pos_scale(args.delta_pos_scale)
 
+    # Same ceiling that sets --speed-scale, expressed as a speed rather than a multiplier.
+    # OSC only: the ik plant realises 72% per tick and was never the binding case.
+    #
+    # RESOLVED BEFORE --speed-scale as of 2026-08-03, because the speed default has to know
+    # whether the retiming is already doing the work. See the block below.
+    if args.motion_speed is None and args.control_mode == "osc":
+        args.motion_speed = (MOTION_SPEED_HEADROOM * args.delta_pos_scale
+                             * OSC_REALISED_FRACTION * args.control_hz / SMOOTHSTEP_PEAK)
+    if args.motion_speed is not None and args.motion_speed <= 0:
+        args.motion_speed = None   # explicit 0 = keep the hand-set durations
+
     # The two knobs solve the same clipping problem, so the speed default has to know
     # which one is already doing the work. OSC_SPEED_SCALE was measured at LIBERO's
     # 0.05 m/unit; the ceiling is linear in the scale, so a larger scale needs
     # proportionally less slowdown, and at 0.125 it needs none.
+    #
+    # FIXED 2026-08-03. `reference_track` applies BOTH knobs -- it retimes the segment to
+    # `dist / motion_speed` and then multiplies by `speed_scale` -- so the ceiling-derived
+    # default below was double-counting whenever the retiming was also active. It went
+    # unnoticed because the two were never simultaneously non-trivial in any collected
+    # dataset: a5 is scale 0.05 (speed_scale 2.5) but predates --motion-speed entirely,
+    # while a6/a7 are scale 0.10-0.20, where `max(1.0, ...)` pins speed_scale at 1.0. It
+    # bites exactly at LIBERO's own 0.05 with the retiming on, which is the setting this
+    # project standardised on: 2.5x on top of an already ceiling-respecting retime, i.e.
+    # ~4x the intended episode length for no benefit -- and a5's own measurement is that
+    # the slowdown did not reduce clipping anyway (README sec.8.1, dx q01 pinned at -1.000).
+    #
+    # So: --motion-speed already respects the ceiling by construction. Do not slow down on
+    # top of it. The ceiling-derived default survives only for --motion-speed 0, where the
+    # hand-set durations are back and nothing else is bounding the reference velocity.
     if args.speed_scale is None:
-        if args.control_mode != "osc":
+        if args.control_mode != "osc" or args.motion_speed is not None:
             args.speed_scale = 1.0
         else:
             args.speed_scale = max(
@@ -736,13 +969,6 @@ def main():
     # the physical disturbance one unit delivers is proportional to the scale. 0.47 at
     # 0.05 m/unit is 0.188 at 0.125, and leaving it at 0.47 would triple the kick the
     # sweep was calibrated to (README sec.4.3) and simply stop episodes succeeding.
-    # Same ceiling that sets --speed-scale, expressed as a speed rather than a multiplier.
-    # OSC only: the ik plant realises 72% per tick and was never the binding case.
-    if args.motion_speed is None and args.control_mode == "osc":
-        args.motion_speed = (MOTION_SPEED_HEADROOM * args.delta_pos_scale
-                             * OSC_REALISED_FRACTION * args.control_hz / SMOOTHSTEP_PEAK)
-    if args.motion_speed is not None and args.motion_speed <= 0:
-        args.motion_speed = None   # explicit 0 = keep the hand-set durations
 
     sigma_gain = L.DELTA_POS_SCALE_LIBERO / args.delta_pos_scale
     if args.noise_sigma_pos is None and args.control_mode == "osc":
@@ -782,7 +1008,7 @@ def main():
     scratch = mujoco.MjData(model)
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "grip_site")
     finger_qposadr = _finger_adr(model)
-    ball_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "green_ball")
+    box_body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, L.TARGET_BODY)
     bin_ids = {n: mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n) for n in BIN_NAMES}
     # Captured BEFORE any episode moves them; --bin-layout scene restores these.
     scene_bin_xy = [model.body_pos[bin_ids[n]][:2].copy() for n in BIN_NAMES]
@@ -822,10 +1048,24 @@ def main():
         f"  (green pinned at {np.round(scene_bin_xy[BIN_NAMES.index('green_bin')], 3)}, "
         "the layout the closed loop evaluates)" if args.bin_layout == "scene" else
         "  (3 slots permuted; the closed loop needs --randomize-bins to match)"))
+    print(f"approach    : " + ("hover -> descend (backoff removed)" if args.no_backoff
+                               else "hover -> withdraw -> re-approach -> descend"))
+    _gates = [g for g in (
+        None if args.max_saturated_frac is None
+        else f"frac > {args.max_saturated_frac:.3%} of joint-steps",
+        None if args.max_torque_frac is None
+        else f"any step > {args.max_torque_frac:.0%} of a joint's limit",
+        None if args.max_sat_run is None
+        else f"> {args.max_sat_run} consecutive saturated steps",
+    ) if g]
+    print("torque gates: " + ("OFF -- recorded, never rejected on" if not _gates
+                              else "reject if " + "; or ".join(_gates)))
     print(f"out         : {args.out}\n")
 
     plan = ([("reach", i) for i in range(args.reach)]
             + [("noise", i) for i in range(args.noise)]
+            + [("drift", i) for i in range(args.drift)]
+            + [("decoy", i) for i in range(args.decoy)]
             + [("recover", i) for i in range(args.recover)])
 
     t0 = time.time()
@@ -838,22 +1078,40 @@ def main():
         # is left empty and reported, rather than filled with a bad episode.
         kept = None
         for attempt in range(args.max_attempts_per_episode):
-            ball_xy = (rng.uniform(*L.BALL_SAMPLE_X), rng.uniform(*L.BALL_SAMPLE_Y))
+            box_xy = (rng.uniform(*L.BOX_SAMPLE_X), rng.uniform(*L.BOX_SAMPLE_Y))
             bin_xy = bin_layout(model, bin_ids, rng, mode=args.bin_layout,
                                 scene_xy=scene_bin_xy)
             frames, states, actions, info = run_episode(
-                model, data, scratch, renderer, site_id, finger_qposadr, ball_body,
-                rng, cohort, args.control_hz, decimation, ball_xy, bin_xy, osc=osc,
-                speed_scale=args.speed_scale, motion_speed=args.motion_speed)
-            if info["lifted"] and (info["placed"] or args.keep_unplaced):
+                model, data, scratch, renderer, site_id, finger_qposadr, box_body,
+                rng, cohort, args.control_hz, decimation, box_xy, bin_xy, osc=osc,
+                speed_scale=args.speed_scale, motion_speed=args.motion_speed,
+                backoff=not args.no_backoff)
+            # Three torque gates, deliberately not one. The fraction catches an episode
+            # that fights the limits throughout; the peak catches a single over-limit
+            # demand anywhere in ~70k joint-steps, which any fraction gate averages into
+            # nothing; the run length catches a joint that lost authority for a stretch
+            # rather than for one isolated step.
+            over_torque = (
+                (args.max_saturated_frac is not None
+                 and info["saturated_frac"] > args.max_saturated_frac)
+                or (args.max_torque_frac is not None
+                    and info["peak_torque_frac"] > args.max_torque_frac)
+                or (args.max_sat_run is not None
+                    and info["max_sat_run"] > args.max_sat_run))
+            if (info["lifted"] and (info["placed"] or args.keep_unplaced)
+                    and not over_torque):
                 kept = (frames, states, actions, info, attempt + 1)
                 break
             rejected += 1
             if args.verbose:
                 print(f"    reject {cohort}_{idx:02d} try {attempt + 1}: "
                       f"lifted={info['lifted']} placed={info['placed']} "
-                      f"ball_max_z={info['ball_max_z']:+.4f} "
-                      f"ball_final={np.round(info['ball_final'], 3)} "
+                      f"sat={info['saturated_frac']:.4%} "
+                      f"peak_tau={info['peak_torque_frac']:.2f}@t{info['peak_torque_tick']} "
+                      f"run={info['max_sat_run']}"
+                      f"{' OVER-TORQUE' if over_torque else ''} "
+                      f"box_max_z={info['box_max_z']:+.4f} "
+                      f"box_final={np.round(info['box_final'], 3)} "
                       f"bin={np.round(info['bin_xy'], 3)} clamped={info['table_clamped_ticks']}")
         name = f"{cohort}_{idx:02d}"
         if kept is None:
@@ -866,7 +1124,9 @@ def main():
                                   **info})
         print(f"  {name:<12} ticks={info['ticks']:>3}  lifted={info['lifted']:<5} "
               f"placed={info['placed']:<5} clamped={info['table_clamped_ticks']:>3}  "
-              f"attempts={attempts}")
+              f"sat={info['saturated_frac']:.4%}  peak_tau={info['peak_torque_frac']:.2f}"
+              f"  run={info['max_sat_run']}  attempts={attempts}"
+              + (f"  drift={info['drift_spans']}" if info["drift_spans"] else ""))
 
     summary = writer.finalize()
     if missing:

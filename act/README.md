@@ -1,5 +1,15 @@
 # `act/` — ACT (Action Chunking Transformer) on the green-ball pick-and-place task
 
+> **Pick target changed 2026-08-03: 40 mm sphere → 40 mm cube**, instruction now *"pick up
+> the green box and put it in the green container"*, scene identifiers renamed
+> `green_ball*` → `green_box*`. Rationale and full change list in
+> [`libero/PROGRESS.md` §26](../libero/PROGRESS.md).
+>
+> **Everything measured on this page was measured on the ball**, including every dataset and
+> checkpoint it names. The prose below has deliberately NOT been reworded — the measurements
+> describe a sphere and would be false if restated about a cube. Command lines HAVE been
+> updated, since the old flag names no longer exist.
+
 The control arm for the SmolVLA experiment. Same scene, same demos, same closed loop, same
 scorer — a policy with **no pretraining and no language**, trained from scratch on our own
 episodes.
@@ -281,7 +291,7 @@ curl -s <url>/health | python3 -m json.tool        # poll until it reports the r
 
 uv run python libero/libero_closed_loop.py \
     --payload-keys libero --server-url <url>/act \
-    --delta-pos-scale 0.10 --randomize-bins --randomize-ball \
+    --delta-pos-scale 0.10 --randomize-bins --randomize-box \
     --chunks 25 --no-view --run-id act_ck60000_00
 
 # P4
