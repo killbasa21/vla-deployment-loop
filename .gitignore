@@ -32,8 +32,13 @@ fine_tunes/**
 !fine_tunes/**/
 !fine_tunes/**/run_info.md
 
-# Generated fine-tune datasets (libero/fine_tune/a1, a2, ...). Same reasoning as
+# Generated fine-tune datasets (libero/fine_tune/a1, a2, ..., b1). Same reasoning as
 # `data/` above: a few hundred MB of inline-PNG parquet per 50 episodes, reproducible
 # from collect_finetune_data.py with the seed recorded in libero/fine_tune/README.md.
-# The collector, the writer and the README ARE tracked -- only the output is not.
-libero/fine_tune/a[0-9]*/
+# The collector, the writer and the READMEs ARE tracked -- only the parquet is not.
+libero/fine_tune/[a-z][0-9]*/**
+!libero/fine_tune/[a-z][0-9]*/
+!libero/fine_tune/[a-z][0-9]*/README.md
+
+# Agent tooling, not part of this project.
+.agents/
