@@ -238,6 +238,33 @@ language — three trays whose colours shuffle every episode, so "the green one"
 memorised as a position — scored over 25 episodes against a scripted expert at 100% and random
 actions at 0%.
 
+### What success and failure actually look like
+
+**ACT from scratch** (row 10), external camera on the left, wrist camera on the right. This is
+the ball-era scene.
+
+| succeeds — places and withdraws | fails — lifts, carries, never lets go |
+|---|---|
+| ![ACT success](docs/img/act_success.gif) | ![ACT failure](docs/img/act_failure.gif) |
+
+The failure on the right is the one that matters: ACT grasps and carries perfectly, parks over
+the green bin, and then just holds on. Nothing about the reach is wrong. At this checkpoint the
+release was a clean function of one number — every `dx ≤ −0.048` held on, everything above let
+go, no exceptions — so an inward carry simply never released.
+
+**SmolVLA on 300 demos** (row 12), the rebuilt scene. Agent view, wrist view, and a HUD showing
+the seven action channels, the target slot, and the success flag. Tray colours are shuffled
+every episode, so the green one has to be read off the image.
+
+| succeeds — 36% of episodes | fails — reaches, grasps, loses it |
+|---|---|
+| ![SmolVLA success](docs/img/smolvla_success.gif) | ![SmolVLA failure](docs/img/smolvla_failure.gif) |
+
+Watch the `grip` bar on the failure. The policy gets to the box and closes, but the wrist is
+rotated wrong at the moment it closes, so the box squirts out and it spends the rest of the
+episode retrying. That is 16 of 25 episodes: not lost, not confused about which tray is green —
+just stuck re-attempting a grasp it keeps getting slightly wrong.
+
 Three findings came out of comparing them.
 
 **The gripper was a channel nobody taught.** Across 20 MolmoAct2 rollouts, every single lift
