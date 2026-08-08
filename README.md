@@ -1,18 +1,33 @@
-# greenbox — teaching a policy to pick up a green box
+# vla-deployment-loop
 
-A learning project about the **whole VLA deployment loop**, not about any one model: a
-Franka Panda in MuJoCo on this machine, a policy server on a rented GPU, HTTP in between,
-and a pick-and-place task that has to actually succeed for the loop to count as working.
+**One robot task. Twelve policies. The one that works is the smallest.**
 
-**The task:** *pick up the green box and put it in the green container.* Box and bin
-positions randomise every episode.
+The task: *pick up the green box and put it in the green container.* The box and the
+container move to random spots every episode. A run only counts if the box ends up in the
+container — getting close doesn't count.
 
-> **The pick target changed on 2026-08-03**, from a 40 mm sphere to a 40 mm cube, and the
-> instruction changed with it. Reason and consequences in
-> [`libero/PROGRESS.md` §26](libero/PROGRESS.md). **Every number on this page was measured
-> on the ball**, as were the `a5`/`a6`/`a7` datasets and every checkpoint trained on them.
-> They are kept because the failure modes they document are still the ones to beat, but no
-> box result can be compared to them without re-measuring.
+> **The target used to be a ball.** For most of this project it was a 40 mm green sphere and
+> the instruction said *"green ball"*. It was changed to a 40 mm cube, and the instruction
+> changed with it. A sphere has no orientation, so a policy could grab it any way it liked; a
+> cube punishes a bad wrist angle. Everything measured before the switch describes the ball,
+> and this page says which is which. Ball and box numbers are not comparable.
+
+---
+
+## 1. The pieces
+
+| piece | what it does here |
+|---|---|
+| **MuJoCo** | the physics simulator, running locally on a laptop |
+| **MuJoCo Menagerie** | where the Franka Panda arm model comes from |
+| **robosuite** | used in the second, rebuilt version of the task — it ships the LIBERO-style controller and scene conventions the pretrained models expect |
+| **LeRobot** | the dataset format the demos are written in, and the trainer for two of the four policies |
+| **Modal** | rents the GPU. Both training and serving run there |
+| **FastAPI + HTTP** | the wire between the two halves. One `POST /act` endpoint, JSON in, actions out |
+
+Nothing about the model runs locally. The laptop only simulates and draws.
+
+## 2. The loop
 
 ```
  ┌──────────── local (this repo) ─────────────┐        ┌──── Modal GPU ────┐
@@ -20,243 +35,284 @@ positions randomise every episode.
  │  - renders external_cam + wrist_cam        │ ─────► │ POST /act          │
  │  - reads proprioception                    │  JSON  │ in:  images,       │
  │  - applies the returned action chunk       │ ◄───── │      instruction,  │
- │  - steps physics, logs every chunk         │        │      state         │
- └────────────────────────────────────────────┘        │ out: (N, 8) chunk  │
-                                                       └────────────────────┘
+ │  - steps physics, logs every chunk         │        │ out: (N, 8) chunk  │
+ └────────────────────────────────────────────┘        └────────────────────┘
 ```
 
-Four policies have been run through that same loop. The interesting part of the project is
-the *comparison*, and the fact that the winner is the smallest model.
+Each request sends two camera images, the arm's current state, and the instruction string.
+The policy replies with a **chunk** — N future actions, not one. The client plays the chunk
+out, then asks again. That's one network round trip per chunk instead of per step, which is
+the only reason a remote GPU is usable at 20 Hz.
 
-## Status, 2026-08-03
+Every policy in this repo speaks that same contract. Same client, same scorer, same wire
+format. Only the server changes.
 
-| track | policy | best measured result | state |
-|---|---|---|---|
-| [`act/`](act/README.md) | **ACT**, from scratch on `a7` | **5/6 placed, 6/6 grasp-and-lift** (ck10000) | **best result so far**; training paused at 30 k / 60 k, resumable |
-| [`libero/`](libero/README.md) | MolmoAct2-LIBERO, fine-tuned on `a5` / `a7` | 2/10 and 1/10 placed | fine-tunes are indistinguishable from the stock baseline |
-| [`libero/`](libero/README.md) | MolmoAct2-LIBERO, stock | 0/3 placed, 1/3 lifted | the baseline everything is scored against |
-| [`smolvla_libero/`](smolvla_libero/README.md) | SmolVLA-450M, LoRA on `a5` | completes the task, ~54 chunks | slow because the expert was slow; `a6` retrain never run |
-| [`droid/`](droid/README.md) | MolmoAct2-DROID, stock + `ae_train` | never placed | **retired** — every run predates the decimation fix, so its ceiling was zero |
+## 3. What's in the repo
 
-The binding constraint today is **not** geometry, reach or speed. It is the **gripper**:
-across 20 MolmoAct2 rollouts, every lift and every placement came from a run where the
-gripper fired at all, and it fired in exactly half of them
-([`libero/PROGRESS.md` §25.1](libero/PROGRESS.md)). ACT is the one policy that closes
-reliably; its remaining failure is the mirror image — it sometimes never *releases*
-([`act/PROGRESS.md` §7.4](act/PROGRESS.md)).
+| path | what |
+|---|---|
+| `libero/` | the shared infrastructure — the scene, the controller, the closed-loop client, the demo collector and the scorer that every other track uses |
+| `act/` | ACT trained from scratch. The best result |
+| `smolvla_libero/` | SmolVLA-450M serving and LoRA training |
+| `droid/` | the first attempt. Retired |
+| `greenbox/` | the task rebuilt from scratch in robosuite, with cleaner metrics |
+| `scenes/` | the MuJoCo scene XMLs. `mujoco_menagerie/` is a pinned submodule and stays pristine |
+| `infra/` | Modal images, and the task instruction, each defined exactly once |
+| `docs/` | old plans and postmortems, each labelled current or superseded |
 
-## Quickstart
-
-Everything is run **from the repo root** with `uv`. Scripts resolve scene XML, `assets/`
-and `data/` relative to the root, so `cd`-ing into a subdirectory will break them.
+Two things live in exactly one file on purpose: every Modal image (`infra/modal_images.py`)
+and the instruction string (`infra/task_spec.py`). The instruction used to be copy-pasted into
+five files. Training on one wording and serving another doesn't throw an error — it just
+quietly asks the policy a question it never studied.
 
 ```bash
-# 1. serve a policy on Modal (prints a URL)
-modal setup                                     # one-time
-modal deploy act/act_modal.py                   # ACT  (best current policy)
-modal deploy libero/libero_modal.py             # MolmoAct2-LIBERO, stock
-modal deploy libero/libero_modal_finetuned.py   # MolmoAct2-LIBERO, a fine-tune on the volume
-modal deploy smolvla_libero/smolvla_modal.py    # SmolVLA
-curl -s <url>/health                            # ALWAYS confirm which checkpoint answered
-
-# 2. run the closed loop against it
-uv run python libero/libero_closed_loop.py \
-    --payload-keys libero --server-url <url>/act \
-    --delta-pos-scale 0.10 --randomize-box --randomize-bins \
-    --chunks 70 --no-view --run-id act_ck30000_00
-
-# 3. score the run logs
-uv run python libero/score_runs.py assets/act/act-green-ball_010000
+git clone --recursive <this repo>    # the scenes need the mujoco_menagerie submodule
+uv sync
 ```
 
-`libero_closed_loop.py` is the client for **every** track, ACT and SmolVLA included — only
-the server changes. Three flags decide whether the run measures anything:
+Install, run, collect and train commands are in [`docs/SETUP.md`](docs/SETUP.md). Everything
+runs from the repo root.
 
-- `--payload-keys libero` sends `{image, wrist_image, instruction, state}`. Required for
-  ACT, SmolVLA and MolmoAct2-LIBERO; the `droid` default sends `external_cam`/`wrist_cam`
-  and those servers 400 rather than run blind.
-- `--delta-pos-scale` **must equal the value the dataset was collected at** — 0.10 for
-  `a7`, 0.20 for `a6`, 0.05 for `a5`. A mismatch does not measure that fine-tune at all.
-- `--randomize-box --randomize-bins` — every fixed-layout number in the logs predates
-  these and is not comparable across them.
+## 4. How the training data was made
 
-Collecting a fresh dataset and training:
+There is no human teleoperation here. A **scripted expert** does the task: move above the box,
+descend, close, lift, carry, release. It's driven by the same controller the policy will later
+drive, which matters more than it sounds.
 
-```bash
-uv run python libero/fine_tune/collect_finetune_data.py --out libero/fine_tune/a8 --episodes 60
-modal run act/act_modal_train.py::main --max-steps 1 --save-freq 1   # SMOKE FIRST, always
-modal run act/act_modal_train.py::main --max-steps 60000 --save-freq 10000
-```
+Each episode randomises the box position and the bin layout. Episodes are **rejection
+sampled** — only successful ones are kept. Everything is written out as a LeRobot dataset:
+one parquet of all episodes, images inlined as PNGs.
 
-Anything collected from 2026-08-03 onward is a **box** dataset — the collector reads the
-target's name, geometry and instruction from the same place the closed loop does, so there
-is no flag to set and no way for the two sides to disagree. `a1`–`a7` are ball datasets and
-stay that way.
+Two bugs in this stage cost more time than any model did.
 
-## Repo layout
+**The labels were measuring error, not intent.** The arm used position actuators that were too
+soft, so it never quite reached the pose it was told to hold — it sagged under gravity and
+stayed there. The collector wrote every label as `(target − current) / scale`, which is the
+*tracking error*. The sag got baked into every label as a constant offset. Over 8700 frames,
+the 1st percentile of the sideways `dx` channel was **−0.08** — the data had almost no
+examples of pulling back, which was exactly the move that kept failing. Fixed by replacing the
+position actuators with an operational-space controller on torque actuators. Sag went from
+4.84 mm to **0.000 mm**. Datasets `a1`–`a4` were thrown out.
 
-```
-act/              ACT trained from scratch. Currently the best-performing track.
-libero/           MolmoAct2-LIBERO port. Owns the scene, the OSC controller, the closed-loop
-                  client and the scorer that every other track reuses.
-  fine_tune/      Demo collection + LeRobot v3.0 writer. Datasets a1..a7 live here (gitignored).
-  tools/          verify_osc.py — the plant checks (sag, penetration, tracking).
-smolvla_libero/   SmolVLA-450M serving + LoRA training.
-droid/            Retired MolmoAct2-DROID track: phases 0-4, the original closed loop,
-                  the IK expert collector and the v2.1 LeRobot writer.
-deck/             index.html — the presentation, with its images.
-docs/             Historical plans and postmortems. See docs/README.md for what is still true.
-scripts/          Small operational helpers.
-fine_tunes/       Pulled checkpoints (gitignored except each run's run_info.md).
-assets/           Per-run debug artifacts, grouped by policy:
-                  <model>/<fine_tune>/logs/<run_id>.jsonl and .../images/<run_id>/. Gitignored.
-infra/            modal_images.py (every Modal image, once) + task_spec.py (the instruction
-                  and the target object, once).
-data/             Locally generated datasets. Gitignored.
-molmoact2/        Vendored reference repo, gitignored, not this project's code.
-mujoco_menagerie/ Vendored reference repo + our scene XMLs. Gitignored — see the warning below.
-```
+> **Lesson:** labels must come from the controller that consumes them. Any label written as
+> `target − current` inherits the robot's tracking error as training signal.
 
-> **The scene XMLs live inside a gitignored vendored repo.** `scene_libero_osc.xml`,
-> `scene_pick_place.xml` and `panda_libero_hand.xml` are ours but are untracked and have no
-> history, which has already cost one silent revert of the arm gains
-> ([`libero/PROGRESS.md` §22](libero/PROGRESS.md)). **Verify plant parameters by compiling
-> the model and reading `actuator_gainprm`, never by reading the XML.**
+**A rotation took the long way round.** In the rebuilt task the scripted expert — the thing
+that generates *all* the data — scored 0/10. Cause: `q` and `−q` describe the same rotation,
+but only one unwraps the short way. A wrist error of −0.77 rad came out as **5.51 rad**, which
+maxed out the rotation channels; because the controller mixes rotation into position, the arm
+was pulled *up* instead of down onto the box. Flipping the sign when `w < 0` took the expert
+from **0/10 to 10/10**.
 
-## Package management
+The datasets that survived:
 
-There are **three** dependency environments in play, and mixing them is the mistake to
-avoid.
+| dataset | episodes | ticks/ep | action scale | target |
+|---|---|---|---|---|
+| `a5` | 30 | 539 | 0.05 | ball |
+| `a6` | 30 | 161 | 0.20 | ball |
+| `a7` | 60 | ~334 | 0.10 | ball |
+| `b1` | 40 | ~410 | 0.05 | **box** |
+| `greenbox` | 300 | — | 0.05 | box, rebuilt scene |
 
-### 1. The local project env — `pyproject.toml` + `uv.lock`, python 3.12
+## 5. Picking a model, and what each one taught
 
-The simulator, the closed-loop client, the dataset writers, the scorers. **This env never
-runs a model**, so `torch`, `lerobot` and `transformers` are deliberately absent from it —
-they would add multiple GB to a venv with no GPU to use them on.
+### 5.1 MolmoAct2-DROID — the training data was the wrong world
 
-```bash
-uv sync                     # exact lockfile
-uv sync --group dev         # + ruff
-uv run ruff check .
-```
+The first choice, and the wrong one. **DROID is pretrained on video of real robots** — real
+lighting, real cameras, an FR3 arm. Our input is a flat-shaded MuJoCo render of a Panda. That
+is two gaps at once: simulated-vs-real, and one arm vs another. It never placed the box, and
+neither did a 500-step fine-tune on top of it.
 
-Rule: a package goes here only if something under `libero/`, `act/`, `smolvla_libero/`,
-`droid/` or `scripts/` imports it **locally**. Anything imported only inside a Modal
-function belongs to env 2.
+There was also a bug underneath, which is the more useful story. **The simulator was ignoring
+97% of every command.** The client stepped physics *once* per action; the demos held each
+action for **33** steps. Every command got 2 ms of simulated time instead of 66 ms.
 
-### 2. Modal images — `infra/modal_images.py`, built remotely
+It was found by feeding the expert's own perfect actions back through the client's code path.
+The box never moved from where it spawned. A perfect policy scored zero on that harness — so
+all three DROID fine-tunes had been graded against a ceiling of zero. Nine days went into
+arguing about which model was worse.
 
-Every image the project deploys is defined **once** in that module:
+> **Lesson:** run the expert through the inference path before blaming a policy. It is nearly
+> free, and it is the only thing that tells "bad policy" apart from "the environment isn't
+> listening."
 
-| helper | python | used by |
-|---|---|---|
-| `lerobot_serve_image()` | 3.12 | `act/act_modal.py`, `smolvla_libero/smolvla_modal.py` |
-| `lerobot_train_image()` | 3.12 | `act/act_modal_train.py`, `smolvla_libero/smolvla_modal_train.py` |
-| `molmoact_serve_image()` | 3.11 | `libero/libero_modal.py` |
-| `molmoact_experiments_image()` | 3.12 | `libero/libero_modal_train.py`, `libero/libero_modal_finetuned.py` |
+### 5.2 MolmoAct2-LIBERO — right world, but the model is too big to afford
 
-`torch==2.5.1` + cu121 and `transformers 4.57.x` are pinned there and **nowhere else** —
-they are what MolmoAct2's own `pyproject.toml` was validated against. Two python versions
-is intentional: 3.11 for the MolmoAct2 serving path matching the vendored repo, 3.12 for
-everything LeRobot.
+LIBERO is a simulated-Panda benchmark, so a checkpoint pretrained on it starts in roughly our
+world. That was the right correction. The problem was size: **5.57 B parameters**, needing a
+24 GB GPU just to serve.
 
-Sharing the definitions is not just tidiness. Modal caches image layers by definition, so
-chains meant to share the multi-GB torch pull silently stop sharing it the moment one
-drifts. Before centralising, that pin was duplicated across five files.
+The switch forced a line-by-line comparison against the reference environment, which turned up
+four errors in a scene that had been rendering plausibly for weeks: the table was 100 mm too
+low, the grip point was 9.5 mm off **and rotated 90°**, the reset pose was wrong, and the world
+origin had the wrong x. The same exercise produced the most useful measurement in the project
+— the stock checkpoint scored **3/3 on a real benchmark task** through the reference
+simulator. That settled the argument: the download was fine and the wire format was fine, so
+everything failing after that was our scene, our data, or our control.
 
-Modal re-imports the app module **inside** the container, so any file importing from
-`infra/` must ship it into the image. `with_infra(...)` does that and **must be the last
-layer** — no build step may follow `add_local_python_source`.
+> **Lesson:** check robot parameters by compiling the model and reading real values, not by
+> reading the XML.
 
-`droid/` keeps its own inline image chains on purpose: the track is retired and its images
-are frozen at what was last deployed.
+But the money ran out before the training did. On a $5 budget, a LoRA run bought **150 steps =
+0.06 epochs** of the dataset. Saving a single checkpoint cost 150 s of GPU time, about 4% of
+the whole budget. At 0.06 epochs the model has barely moved off its base weights — the risk
+isn't overfitting, it's that no training happened at all. Later, properly funded fine-tunes on
+`a5` and `a7` scored 2/10 and 1/10, which is indistinguishable from the untrained baseline.
 
-### 3. The hf-libero env — a separate venv, outside this project
+> **Lesson:** a large model doesn't just cost more per step, it converts a fixed budget into
+> fewer steps. Check what your budget buys in *epochs* before picking the model.
 
-`libero/libero_benchmark_eval.py` needs `hf-libero`, which pins its own `robosuite` and
-`mujoco`. **It must not be installed into the project env.** Run it explicitly:
+### 5.3 SmolVLA-450M — small enough to actually train, but it needs data
 
-```bash
-MUJOCO_GL=egl <hf-libero-venv>/bin/python libero/libero_benchmark_eval.py \
-    --server-url <url>/act --suite libero_object --task-id 0 --episodes 3
-```
+**12× smaller**, serves on the cheapest GPU available. The same $5 becomes a real training run
+instead of a rounding error. That's the whole argument for it, and it held up.
 
-> **Name collision:** our directory `libero/` shadows the PyPI package `libero`. That file's
-> `from libero.libero.envs import OffScreenRenderEnv` resolves only because it runs from the
-> other venv with a different working directory. From the repo root it would import our
-> directory instead. The import is deliberately deferred inside a function; keep it that way.
+The results split cleanly by how much data it got:
 
-## Run artifacts
+- **30–60 demos:** poor. Its first fine-tune did finish the task, but slowly — about 54 action
+  chunks — because its demos were slow (539 ticks each). Copying a slow teacher gives you a
+  slow student. Later fine-tunes on 60 demos scored 0/13.
+- **300 demos, in a scene built to match its pretraining conventions:** **36%**, and the curve
+  was still climbing when training stopped.
 
-Every closed-loop run writes two things, grouped by the policy that produced them:
+> **Lesson:** the small model wasn't weak — it was starved. What moved it was more demos, and
+> demos that looked like what it was pretrained on.
 
-```
-assets/
-  <model>/<fine_tune>/
-    logs/<run_id>.jsonl              one JSON object per action chunk
-    images/<run_id>/                 camera_<timestamp_ms>_<cam>.png, both cams interleaved
-```
+One clear negative result: a variant that **unfroze the vision encoder** did worse, and
+steadily worse. Across 5 checkpoints × 10 seeds, the best score came from the *earliest*
+checkpoint (1/10 at step 488) and every later one scored zero. Unfreezing a pretrained vision
+tower and LoRA-ing it on 40 episodes damages features that were already good.
 
-`<model>/<fine_tune>` comes from `--model` / `--fine-tune`. Leave them off and
-`libero_closed_loop.py` reads the server's `/health` `checkpoint` field and derives them:
-`HuggingFaceVLA/smolvla_libero` → `smolvla_libero/stock`,
-`/checkpoints/act/act-green-ball/checkpoints/010000/…` → `act/act-green-ball_010000`. A
-server that reports no checkpoint gives `unknown-model/unknown` — deliberately ugly, so an
-unattributable run looks wrong in `ls`. Each log entry also carries `model` and `fine_tune`
-so a file copied out of the tree still says what produced it.
+### 5.4 ACT — no pretraining at all
 
-Grouping by policy is what makes comparison possible: `score_runs.py` accepts a directory
-and searches it recursively, so one policy is `score_runs.py assets/act/act-green-ball_010000`
-and everything ever run is `score_runs.py assets/`.
+ACT was added to settle a question: was SmolVLA missing the grasp because of *units*, or
+because it couldn't *see* well enough? ACT answers it directly by having no frozen vision at
+all — a ResNet18 in the gradient path from step 0, **51.6 M** trainable parameters, no
+pretraining to preserve.
 
-Both files are written and flushed **during** the run — `tail -f` works, and frames land on
-disk immediately after each `mj_step` rather than being buffered to the end. `--dry-run`
-writes the log but never renders. `assets/` is gitignored; it is bulky regenerated debug
-output, and it was committed by accident once already.
+Trained on the same 60 demos the SmolVLA LoRA failed on, it placed the ball 5 times out of 6
+and picked it up **12 out of 12**. So it was seeing, not units. A model that can adapt its
+vision learns this task from 60 episodes; a frozen-tower LoRA on the same data does not.
 
-> Runs from before 2026-08-02 are in the old flat `assets/logs/` and `assets/images/`.
-> They were left where they are — `score_runs.py` still reads them by path.
+## 6. How it was fine-tuned
 
-## Reading order
+| policy | trainable | hardware | steps | notes |
+|---|---|---|---|---|
+| MolmoAct2-LIBERO | LoRA r32 | L4 24 GB | 150 → later runs longer | $5 bought 0.06 epochs |
+| SmolVLA (`a5`/`a7`) | action expert only | T4 16 GB | 5000 | vision + language frozen |
+| SmolVLA (`b1`) | action expert **+ vision** | L4 | 2438 | the unfreeze experiment |
+| SmolVLA (rebuilt) | 99.9 M of 450 M (22.2%) | L4 | 12 000 | batch 16, lr 1e-4 cosine, bf16, ~96 min |
+| ACT | 51.6 M, all of it | L4 | paused at 30 k of 60 k | batch 16, saves every 10 k |
 
-New to the project, in order:
+Two practical notes. ACT's training was **dataloader-bound, not GPU-bound** — the GPU spent
+more time waiting for PNG decodes (0.110 s) than computing (0.099 s), and doubling the worker
+count only moved the bottleneck onto CPU cores, which are billed separately. And every
+training run starts with a **1-step smoke run** that proves build → load → step → save. More
+than one step proves nothing extra and costs real money.
 
-1. **This file** — what exists and what the scores are.
-2. [`PROGRESS.md`](PROGRESS.md) — how it got here, one section per track, and what each
-   track proved or disproved. The cross-track story.
-3. The track you care about: [`act/README.md`](act/README.md),
-   [`libero/README.md`](libero/README.md), [`smolvla_libero/README.md`](smolvla_libero/README.md),
-   [`droid/README.md`](droid/README.md).
-4. That track's `PROGRESS.md` — the chronological attempt log, wrong turns deliberately
-   kept in.
-5. [`docs/README.md`](docs/README.md) — the historical plans and postmortems, each labelled
-   current / historical / superseded.
+## 7. Results
 
-**Precedence when documents disagree**, newest wins in this order:
-`libero/PROGRESS.md` and `act/PROGRESS.md` (measurements, newest at the bottom) →
-subproject `README.md` (the spec) → `docs/` (history, partly superseded).
-Numbers in `docs/` predate the OSC port and the decimation fix; treat them as evidence of
-what was believed at the time, not as current fact. **Re-measure anything load-bearing.**
+`placed` means the task succeeded. `lift` means the box left the table in the gripper — worth
+tracking separately, because for most of these it's as far as they ever got.
 
-## Conventions worth knowing before you touch anything
+| # | policy | data | target | placed | lift |
+|---|---|---|---|---|---|
+| 1 | ~~MolmoAct2-DROID, stock~~ | — | ball | 0 | 0 |
+| 2 | ~~MolmoAct2-DROID, `ae_train`~~ | `a1`–`a4` | ball | 0 | 0 |
+| 3 | ~~MolmoAct2-DROID, `lora_train`~~ | `a1`–`a4` | ball | 0 | 0 |
+| 4 | MolmoAct2-LIBERO, stock (baseline) | — | ball | 0/3 | 1/3 |
+| 5 | MolmoAct2-LIBERO, fine-tuned | `a5` | ball | 2/10 | 3/10 |
+| 6 | MolmoAct2-LIBERO, fine-tuned | `a7` | ball | 1/10 | 2/10 |
+| 7 | SmolVLA-450M, LoRA | `a5` | ball | completes † | — |
+| 8 | SmolVLA-450M, LoRA | `a7` | ball | 0/13 | 2/13 |
+| 9 | SmolVLA-450M, LoRA + vision, 5 ck | `b1` | **box** | 1/52 | 2/52 |
+| 10 | **ACT, from scratch** | `a7`, 60 eps | ball | **5/6** | **6/6** |
+| 11 | ACT, trained 3× longer | `a7` | ball | 6/8 | 8/8 |
+| 12 | **SmolVLA-450M, rebuilt task** | 300 demos | box | **36%** | 84% grasped |
 
-- **Smoke runs are 1 step.** `--max-steps 1 --save-freq 1` proves build → load → step →
-  save. Any more burns GPU money for no extra signal.
-- **`/health` before every evaluation.** A deployment that silently kept serving the old
-  checkpoint has produced wrong conclusions here more than once.
-- **Progress logs keep the wrong turns in.** Several conclusions in them were later
-  reversed; knowing *which* were reversed is the useful part. Corrections are appended as
-  new sections, never edited into old ones.
-- **The last checkpoint is not the best one** — demonstrated twice, on two architectures
-  ([`act/PROGRESS.md` §7.5](act/PROGRESS.md)). Score intermediate checkpoints.
-- **A run log written by a live run is incomplete.** `score_runs.py` prints `INCOMPLETE`;
-  believe it. A truncated log ends mid-carry and scores exactly like a release failure.
-- **The task's instruction string is defined once,** in `infra/task_spec.py`, and imported
-  by the collector, the closed loop and all three servers. It used to be five literals. A
-  prompt that differs between training and serving does not raise — it silently conditions
-  the policy on something it never saw.
-- **The pick target is a 40 mm cube, and has been since 2026-08-03**
-  ([`libero/PROGRESS.md` §26](libero/PROGRESS.md)). It was a 40 mm sphere before that, which
-  is why `score_runs.py` still reads a `ball_radius` key alongside `box_half` — old logs
-  must keep scoring correctly, and that key is the only record in the log format of which
-  object a run used.
+Rows 1–3 measured the decimation bug, not a policy. Row 7 † finished the task but has no
+scored rollouts — only the observation that it worked, slowly. Row 10's 5/6 is the six
+evaluation seeds; across all twelve logged rollouts, including six deliberately awkward box
+positions, it's 7/12 placed and 12/12 lifted. Row 12 is a different scene with harder
+language — three trays whose colours shuffle every episode, so "the green one" can't be
+memorised as a position — scored over 25 episodes against a scripted expert at 100% and random
+actions at 0%.
+
+Three findings came out of comparing them.
+
+**The gripper was a channel nobody taught.** Across 20 MolmoAct2 rollouts, every single lift
+and every single placement came from a run where the gripper closed *at all* — and it closed
+in exactly half of them. Worse, closing was nearly uncorrelated with the hand being near the
+box: one run closed 0.7 mm away but 58 chunks too late, another did a full close-carry-release
+on an empty hand 39 mm away. The cause is in the data: the expert only ever closes on a
+perfectly centred, stationary box, and rejection sampling deletes every episode where contact
+went wrong. The states the policy is actually in when it has to decide are absent from
+training **by construction**.
+
+**In the rebuilt task, the bottleneck was the wrist, not the language.** Colour grounding was
+never the problem — across every checkpoint, the policy put the box in a wrong-coloured tray
+**0 times out of 25**. But it grasped 84% of the time and only lifted 36%. The measurements
+say why: at the moment it closes, the gripper is 0.045 m from the box (close enough) but
+**0.394 rad off in wrist angle**, against 0.048 rad it had already achieved earlier in the
+same episode. It reaches the right place with the right angle, then rotates away before
+closing. This is where the ball-to-box change bites — a sphere would have forgiven it.
+
+**The last checkpoint is not the best one.** Shown three times, on three different models. ACT
+at 10 k had a clean rule for when it let go — every `dx ≤ −0.048` held on, everything above
+released, no exceptions. At 30 k it placed slightly more often but that rule went ragged, even
+as its motion got smoother and its grasps got tighter. SmolVLA's 3 k checkpoint beat its 5 k
+one. The unfreeze sweep peaked at its very first checkpoint. **Score intermediate
+checkpoints.**
+
+One more, found by accident: **the scorer itself was wrong.** A run reported `placed 32%` and
+`released 8%`, which is impossible — you have to let go before it counts as placed. `released`
+was being recorded the *first* time the gripper lost contact, and contact flickers during
+transport. Changed to the last let-go, the numbers lined up.
+
+> **Lesson:** build the metric as a chain where each stage requires the one before it, then
+> look for totals that can't happen.
+
+## 8. What's next
+
+**Fine-tune the VLM properly.** The unfreeze experiment failed, but it failed on 40 episodes.
+The question of whether the language model can be adapted rather than damaged is still open,
+and 300+ demos is the setting to ask it in.
+
+**A small patch-based policy for lightweight tasks.** Most of what this task needs is local:
+where the box is relative to the gripper. A policy operating on image patches instead of a
+full vision-language stack should be far cheaper for that class of problem.
+
+**ACT inside a mixture of experts, for many tasks.** ACT's output is a densely encoded action
+chunk — a lot of behaviour packed into a small model. That makes it a good candidate as one
+expert among several, routed per task, instead of retraining a whole model per skill.
+
+**An RL environment on top of SmolVLA.** Behaviour cloning can only copy the demonstrations,
+which is why the slow expert produced a slow policy and why the untrained states around a
+failed grasp were never learned. Fine-tuning with reinforcement learning in the same simulator
+would let it improve past what the expert showed it.
+
+## Reading further
+
+The detail behind every number on this page:
+
+1. [`docs/SETUP.md`](docs/SETUP.md) — install, run, collect, train
+2. [`PROGRESS.md`](PROGRESS.md) — the cross-track story, one section per track
+3. The track you care about: [`act/`](act/README.md), [`libero/`](libero/README.md),
+   [`smolvla_libero/`](smolvla_libero/README.md), [`greenbox/`](greenbox/README.md),
+   [`droid/`](droid/README.md)
+4. That track's `PROGRESS.md` — the chronological attempt log, **wrong turns kept in**
+5. [`docs/README.md`](docs/README.md) — old plans and postmortems, each labelled current or
+   superseded
+
+**When two documents disagree, newest wins**, in this order: `libero/PROGRESS.md` and
+`act/PROGRESS.md` (the measurements) → the subproject `README.md` → this file → `docs/`.
+Numbers written before the decimation fix and the controller port are evidence of what was
+believed at the time, not current fact. Re-measure anything load-bearing.
+
+A note on the progress logs: they keep the wrong turns in on purpose. Corrections are appended
+as new sections rather than edited into old ones, because knowing *which* conclusions were
+reversed is most of the value.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

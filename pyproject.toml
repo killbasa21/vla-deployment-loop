@@ -1,5 +1,5 @@
 [project]
-name = "greenbox"
+name = "vla-deployment-loop"
 version = "0.1.0"
 description = "Closed-loop VLA pick-and-place on a simulated Franka Panda: MuJoCo locally, policy server on Modal"
 readme = "README.md"

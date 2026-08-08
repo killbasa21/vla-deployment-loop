@@ -13,19 +13,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
 
 import requests
 
-DEFAULT_URL = "https://hardikkapoor1021--greenbox-policyserver-web.modal.run"
+# Your own deployment's URL. Modal derives it from your workspace name, so there is no
+# shareable default -- `modal deploy infra/modal_app.py` prints it, and GREENBOX_SERVER_URL
+# saves passing --url every time.
+DEFAULT_URL = os.environ.get("GREENBOX_SERVER_URL")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--url", default=DEFAULT_URL)
+    p.add_argument(
+        "--url",
+        default=DEFAULT_URL,
+        required=DEFAULT_URL is None,
+        help="policy server URL; defaults to $GREENBOX_SERVER_URL",
+    )
     p.add_argument("--volume", default="greenbox-vol")
     p.add_argument("--stats-path", default=None)
     args = p.parse_args()
