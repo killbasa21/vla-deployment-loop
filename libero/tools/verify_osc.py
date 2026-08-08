@@ -31,7 +31,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from libero.osc_controller import OSCController  # noqa: E402
 
-SCENE = "mujoco_menagerie/franka_emika_panda/scene_libero_osc.xml"
+SCENE = "scenes/franka_emika_panda/scene_libero_osc.xml"
 LIBERO_INIT_QPOS = np.array(
     [0.0, -0.16103739, 0.0, -2.44459747, 0.0, 2.2267522, 0.78539816])
 TABLE_TOP_Z = -0.012

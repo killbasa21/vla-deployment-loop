@@ -73,7 +73,7 @@ Usage:
     uv run python libero/libero_closed_loop.py --chunks 20 --server-url <url>/act
     uv run python libero/libero_closed_loop.py --chunks 20 --image-flip 180 --server-url <url>/act
     uv run python libero/libero_closed_loop.py --control-mode ik \
-        --model-path mujoco_menagerie/franka_emika_panda/scene_libero_hand.xml ...
+        --model-path scenes/franka_emika_panda/scene_libero_hand.xml ...
 
     # serving a fine-tune: the scale and the bin randomisation must match COLLECTION.
     # a6 was 0.20, a7 is 0.10 -- check the dataset, do not assume.
@@ -132,8 +132,8 @@ json_numpy.patch()
 # garbage rather than an error, so main() checks the actuator type and refuses. The
 # default follows --control-mode; --model-path overrides it explicitly.
 SCENE_FOR_MODE = {
-    "osc": "mujoco_menagerie/franka_emika_panda/scene_libero_osc.xml",
-    "ik": "mujoco_menagerie/franka_emika_panda/scene_libero_hand.xml",
+    "osc": "scenes/franka_emika_panda/scene_libero_osc.xml",
+    "ik": "scenes/franka_emika_panda/scene_libero_hand.xml",
 }
 DEFAULT_MODEL_PATH = SCENE_FOR_MODE["ik"]   # kept: imported by score_runs.py's --model-path
 SERVER_URL = "http://localhost:8000/act"

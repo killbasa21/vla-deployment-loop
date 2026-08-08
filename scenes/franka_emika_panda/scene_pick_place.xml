@@ -1,0 +1,115 @@
+<mujoco model="panda pick and place">
+  <!-- Pull in the Panda arm + its existing floor/lighting/skybox scene, then add our
+       task-specific objects on top: the graspable red box and the colored bins.
+
+       NOTE ON PATHS: MuJoCo resolves meshdir against the directory of the top-level file
+       you pass to from_xml_path(), NOT against the file that declares it. The declaration
+       is in panda_robotiq.xml (reached via scene_base.xml) and spells out the full way
+       back to the submodule's assets, which is what lets this file live in scenes/
+       instead of inside mujoco_menagerie/.
+
+       scene_base.xml and panda_robotiq.xml are our forks of the submodule's scene.xml and
+       panda.xml -- panda.xml was edited in place to graft on a Robotiq 2F-85 gripper for
+       the retired DROID track, and a submodule cannot carry a local edit. -->
+  <include file="scene_base.xml"/>
+
+  <asset>
+    <!-- Prefixed obj_ because panda.xml already defines a material literally named
+         "green" (used for one of the robot's status-LED meshes) -- reusing that name
+         here raised: "XML Error: repeated name 'green' in material". Any name is fine
+         as long as it doesn't collide with names already defined in included files. -->
+    <material name="obj_red" rgba="0.8 0.1 0.1 1"/>
+    <material name="obj_green" rgba="0.1 0.7 0.2 1"/>
+    <material name="obj_blue" rgba="0.1 0.3 0.8 1"/>
+    <material name="obj_yellow" rgba="0.85 0.75 0.1 1"/>
+  </asset>
+
+  <worldbody>
+    <!-- The graspable object. <freejoint/> gives this body 6 unconstrained DOFs
+         (3 translation + 3 rotation, stored internally as xyz + quaternion) instead of
+         welding it rigidly to the world -- so gravity, contact with the table, and
+         (eventually) the gripper's fingers can all push it around like a real object.
+         Everything else in this scene (the bins) has NO joint at all, which in MuJoCo
+         means "rigidly fixed to its parent" (here, the world) -- they don't need to
+         move, so we don't pay the simulation cost of extra DOFs for them.
+
+         pos="0.5 0 0.02": chosen empirically, not derived analytically -- 0.5m out
+         from the base along the arm's default-facing axis, roughly mid-reach for a
+         Panda, and z=0.02 sits the box's bottom face exactly on the floor (its geom
+         is a box with half-size 0.02, so its center must be 0.02 above z=0 for the
+         bottom face to touch the floor). Confirmed by rendering the external camera. -->
+    <body name="red_box" pos="0.5 0 0.02">
+      <freejoint/>
+      <geom name="red_box_geom" type="box" size="0.02 0.02 0.02" material="obj_red" mass="0.05"/>
+    </body>
+
+    <!-- The green box -- the actual pick target for the IK-driven demo collector
+         (phase4_collect_demos.py). A freejoint cube, geometrically identical to red_box, so
+         gravity / table contact / the gripper fingers all act on it. Half-extent 0.02
+         (40mm across) is comfortably inside the Robotiq 2F-85's ~85mm max opening, so it's
+         graspable. z=0.02 rests the cube's bottom face exactly on the floor (centre = half
+         extent above z=0). The pos here is only a placeholder default:
+         phase4_collect_demos.py overwrites this body's freejoint qpos per episode
+         (randomized within the arm's reachable workspace) to diversify the recorded
+         demonstrations. Mass 0.05 kg, matching red_box, so the same gripper force closes on
+         it the same way.
+         Was a 40 mm sphere until 2026-08-03; see libero/PROGRESS.md sec.26. `droid/` is
+         retired, so this scene is changed for consistency only -- nothing is measured here. -->
+    <body name="green_box" pos="0.45 -0.1 0.02">
+      <freejoint/>
+      <geom name="green_box_geom" type="box" size="0.02 0.02 0.02" material="obj_green" mass="0.05"/>
+    </body>
+
+    <!-- Bins: each is an open-top tray built from 5 box geoms -- one flat bottom plus
+         four thin walls standing around its edges (a real container mesh would look
+         nicer, but 5 primitive boxes is enough to be visually and physically a "bin"
+         with no authoring/asset work). All four wall geoms share the same wall
+         thickness (0.002) and height (0.02) and are just placed at +/-0.05 along x
+         and y -- i.e. the walls of a 10cm x 10cm x 4cm tray centered on the body's
+         local origin. Positioned 0.25m to either side of the box (green/blue) and
+         0.2m further out (yellow) purely so they don't overlap each other or the box. -->
+    <body name="green_bin" pos="0.5 0.25 0">
+      <geom type="box" size="0.05 0.05 0.002" pos="0 0 0.002" material="obj_green"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="0.05 0 0.02" material="obj_green"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="-0.05 0 0.02" material="obj_green"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 0.05 0.02" material="obj_green"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 -0.05 0.02" material="obj_green"/>
+    </body>
+
+    <body name="blue_bin" pos="0.5 -0.25 0">
+      <geom type="box" size="0.05 0.05 0.002" pos="0 0 0.002" material="obj_blue"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="0.05 0 0.02" material="obj_blue"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="-0.05 0 0.02" material="obj_blue"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 0.05 0.02" material="obj_blue"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 -0.05 0.02" material="obj_blue"/>
+    </body>
+
+    <body name="yellow_bin" pos="0.7 0 0">
+      <geom type="box" size="0.05 0.05 0.002" pos="0 0 0.002" material="obj_yellow"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="0.05 0 0.02" material="obj_yellow"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="-0.05 0 0.02" material="obj_yellow"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 0.05 0.02" material="obj_yellow"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 -0.05 0.02" material="obj_yellow"/>
+    </body>
+
+    <!-- An anchor point: a body with no geom at all (so it's entirely invisible --
+         nothing to render), placed roughly at the center of the scene, purely so the
+         camera below has something to reference via mode="targetbody". This saves us
+         from hand-computing a look-at quaternion -- MuJoCo does that math every frame
+         instead, automatically re-aiming at this point's world position. -->
+    <body name="scene_center" pos="0.55 0 0.05"/>
+
+    <!-- External/overhead-ish camera. mode="targetbody" means "ignore whatever
+         orientation I'd normally have; always point at target's body origin instead" --
+         so pos is the only thing we needed to tune (chosen by trial: elevated, and
+         offset diagonally so the arm's own base doesn't block the objects). -->
+    <!-- fovy matches MolmoAct2-DROID's real exterior camera spec (sim_eval/robots/franka_droid.py:
+         focal=2.1mm, sensor=3.024mm -> 2*atan(3.024/(2*2.1)) ~= 71.5 degrees), a wider field of
+         view than our previous default (MuJoCo's implicit 45 deg). DROID's own eye/target world
+         coordinates aren't reused here -- they're defined relative to their specific rig's
+         coordinate frame, which doesn't correspond to our scene's layout/scale, so keeping our
+         own render-and-check-verified eye position while matching their FOV (a frame-independent
+         physical camera property) is the more reliable transfer. -->
+    <camera name="external_cam" mode="targetbody" target="scene_center" pos="1.2 -0.9 0.9" fovy="71.5"/>
+  </worldbody>
+</mujoco>

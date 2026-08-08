@@ -1,0 +1,229 @@
+<mujoco model="panda pick and place (LIBERO-matched, torque actuators, native OSC)">
+  <!-- IDENTICAL to scene_libero_hand.xml except that it includes panda_libero_osc.xml
+       (torque actuators) instead of panda_libero_hand.xml (position servos). See the
+       include below, and ADDITION 7 in panda_libero_osc.xml.
+       Everything from here to the include is scene_libero_hand.xml verbatim. -->
+
+  <!-- LIBERO-matched scene for libero/libero_closed_loop.py.
+
+       IDENTICAL to scene_libero.xml except for the include: this one pulls
+       panda_libero_hand.xml (stock Franka hand, robosuite pad params, robosuite's own
+       grip_site and eye_in_hand camera) instead of panda.xml (Robotiq 2F-85). Table,
+       pedestal, floor, objects, bins and external_cam are unchanged and still verified
+       against the robosuite numbers quoted below -- none of them depend on the gripper.
+       scene_libero.xml is kept so the 2F-85 runs stay reproducible.
+
+       WHY meshdir IS AN EXPLICIT RELATIVE PATH: MuJoCo resolves meshdir against the
+       directory of the TOP-LEVEL file given to from_xml_path(), not against the file
+       that declares it. This scene lives in scenes/ and the meshes live in the
+       mujoco_menagerie submodule, so meshdir must spell out the way back:
+       ../../mujoco_menagerie/franka_emika_panda/assets. It used to say just "assets",
+       which forced these files to sit inside the submodule -- untracked, with no
+       history, and one silent revert of the arm gains as a result.
+
+       WHY IT INCLUDES panda.xml AND NOT scene.xml: scene.xml puts its ground plane at
+       z = 0, which is exactly where panda.xml puts link0. LIBERO needs the floor 0.912 m
+       BELOW the robot base (see below), so the floor has to move -- hence scene.xml's
+       ~20 lines of visual/asset/light are reproduced here with a relocated plane.
+
+       ===================================================================
+       GROUND TRUTH (read out of robosuite 1.5.2, not guessed)
+       ===================================================================
+       Panda.base_xpos_offset["table"](0.8)  = (-0.56, 0, 0)
+       Panda.default_base                    = "RethinkMount"
+       RobotModel.bottom_offset              = (0, 0, -0.912)
+       set_base_xpos => link0 = pos - bottom_offset
+         => link0 world pos                  = (-0.56, 0, 0.912)
+       TableArena table_offset               = (0, 0, 0.8)   [table TOP]
+       table_full_size                       = (0.8, 0.8, 0.05)
+       Panda.init_qpos = (0, 0.19635, 0, -2.61799, 0, 2.94159, 0.78540)
+
+       The consequence, and the thing that was wrong before: LIBERO's Panda is NOT
+       floor-mounted. It sits on a 0.912 m pedestal, so its base is 0.112 m ABOVE the
+       table top and the arm works DOWNWARD onto a surface just below itself. Our scene
+       had the arm bolted at z = 0 reaching DOWN to objects at z = 0.02 -- so every
+       eef_pos we reported was ~0.8 m below anything in the checkpoint's training
+       distribution, and the model responded by commanding descent until the arm bottomed
+       out on the floor.
+
+       ===================================================================
+       THIS FILE'S FRAME: world origin AT THE ROBOT BASE (link0 = 0,0,0)
+       ===================================================================
+       We cannot move link0 -- it is fixed at the origin by panda.xml, and editing that
+       would change the DROID path and invalidate the collected dataset. So instead of
+       raising the robot to LIBERO's 0.912, we lower everything else by the same amount.
+       The RELATIVE geometry -- which is all the physics and the arm's posture depend on
+       -- is then identical to LIBERO:
+
+         quantity                     LIBERO frame     this file     delta
+         link0                        z = 0.912        z =  0.0      -0.912
+         table top                    z = 0.900        z = -0.012    -0.912
+         ground                       z = 0.000        z = -0.912    -0.912
+         table centre (x)             x = 0.0          x =  0.60     +0.60
+         eef at LIBERO reset          z = 1.173        z =  0.261    -0.912
+
+       CORRECTED 2026-07-28. The table top used to sit at -0.112, i.e. 0.112 m below
+       link0, on the reading that LIBERO's table is at 0.800 with link0 at 0.912. A
+       live LIBERO env says otherwise: link0 0.912, table top 0.900, so the surface is
+       only 0.012 m below the base. Our table was 100 mm too LOW -- every descent the
+       policy commanded fell short of the surface it expected, which is the single
+       most likely cause of it continuing to press downward into the table.
+
+       Absolute coordinates therefore differ from LIBERO by a constant
+       (+0.56, 0, -0.912). Since the model conditions on absolute eef_pos, the loop adds
+       (-0.56, 0, +0.912) back before sending state -- a pure change of origin, not a
+       fudge. See LIBERO_ORIGIN_OFFSET in libero_closed_loop.py.
+  -->
+  <!-- The ONLY difference from scene_libero_hand.xml. panda_libero_osc.xml is that file
+       with the arm's position servos replaced by torque <motor> actuators, so that
+       libero_closed_loop.py --control-mode osc can drive the arm the way LIBERO does
+       (robosuite OSC_POSE -> joint torques) instead of via a DLS IK solve into position
+       actuators. Table, pedestal, floor, objects, bins, ball contact params and
+       external_cam are byte-identical and unaffected -- none of them depend on how the
+       arm is actuated. -->
+  <include file="panda_libero_osc.xml"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+
+    <!-- Table top kept light and matte, like robosuite's ceramic table material. -->
+    <material name="table_top_mat" rgba="0.85 0.82 0.78 1" specular="0.1" shininess="0.1"/>
+    <material name="pedestal_mat" rgba="0.25 0.25 0.28 1"/>
+
+    <!-- Prefixed obj_ because panda.xml already defines a material named "green"
+         (a status-LED mesh) -- reusing it raises "repeated name 'green' in material". -->
+    <material name="obj_red" rgba="0.8 0.1 0.1 1"/>
+    <material name="obj_green" rgba="0.1 0.7 0.2 1"/>
+    <material name="obj_blue" rgba="0.1 0.3 0.8 1"/>
+    <material name="obj_yellow" rgba="0.85 0.75 0.1 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
+
+    <!-- Ground 0.912 m below the robot base, matching RethinkMount's height. -->
+    <geom name="floor" pos="0 0 -0.912" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- The pedestal the robot stands on. Purely cosmetic/structural: fills the gap
+         between the relocated floor and link0 so the arm isn't floating in mid-air, and
+         gives roughly the visual mass of robosuite's RethinkMount pedestal. -->
+    <body name="pedestal" pos="0 0 -0.456">
+      <geom type="box" size="0.18 0.18 0.456" material="pedestal_mat"/>
+    </body>
+
+    <!-- TABLE. robosuite's static LIBERO scenes model it as one solid box of half-size
+         (0.4, 0.4, 0.4) whose top face is the work surface, so that is reproduced here
+         rather than TableArena's thin-top-plus-legs variant (same surface, fewer geoms,
+         and no legs for the arm to catch on).
+           half-size (0.4, 0.4, 0.45), centre z = -0.462
+           => top face at -0.462 + 0.45 = -0.012   (LIBERO's 0.900, measured)
+           => bottom still at -0.912, i.e. resting exactly on the floor
+         Centred 0.56 m in front of the base in x, so the near edge is 0.16 m away --
+         the same base-to-table gap LIBERO has (base -0.6, table spans -0.5..0.5). -->
+    <body name="table" pos="0.56 0 -0.462">
+      <geom name="table_geom" type="box" size="0.4 0.4 0.45" material="table_top_mat" friction="1 0.005 0.0001"/>
+    </body>
+
+    <!-- Objects now rest ON THE TABLE (top at z = -0.012) rather than on the floor.
+         Sphere centres sit one radius above the surface; bins sit flat on it. -->
+
+    <body name="red_box" pos="0.56 -0.28 0.008">
+      <freejoint/>
+      <geom name="red_box_geom" type="box" size="0.02 0.02 0.02" material="obj_red" mass="0.05"/>
+    </body>
+
+    <!-- The pick target. A 40 mm CUBE as of 2026-08-03, replacing the 40 mm sphere that was
+         here before: half-extent 0.02, the same 40 mm across, and still well inside the
+         stock Franka hand's 80 mm opening (2 x finger_joint range 0.04). Rationale in
+         libero/PROGRESS.md sec.26 -- a sphere has one contact point, rolls out under a
+         closing gripper and offers no face to align to, and sec.25 measured closure as the
+         binding constraint on this task.
+         Position here is only a default -- the loop overwrites this freejoint per episode. -->
+    <body name="green_box" pos="0.56 0 0.008">
+      <freejoint/>
+      <!-- CONTACT PARAMS (2026-07-28). Inherited from the sphere and DELIBERATELY KEPT even
+           though the reasoning that produced them no longer holds. That reasoning was: a
+           40 mm sphere between two flat pads has no form closure, it is held by friction
+           alone, and with menagerie's default contact softness a sustained squeeze extrudes
+           it -- traced tick by tick, the fingers seated correctly at 0.0195 m for ~17 ticks,
+           then drove on through to 0.0000 and the ball shot out sideways, so every demo
+           lifted the ball and then dropped it 0.10-0.12 m short of the bin.
+           A cube has flat faces and therefore form closure, so it does not need condim 4 to
+           stop it rolling out. Holding the params fixed anyway keeps the box scene one
+           variable away from the ball scene. Retune only against a measurement.
+             priority 2   outranks the pads' priority 1, so THESE params win the contact
+             condim 4     torsional friction; load-bearing for a sphere, redundant for a cube
+             solref/solimp  stiff and near-rigid, so the squeeze stops at the surface
+                          instead of slowly sinking into it -- still earns its place -->
+      <geom name="green_box_geom" type="box" size="0.02 0.02 0.02" material="obj_green" mass="0.05"
+        priority="2" condim="4" friction="2 0.05 0.0001"
+        solref="0.004 1" solimp="0.99 0.999 0.001"/>
+    </body>
+
+    <!-- Bins: open-top trays, 5 box geoms each (flat bottom + 4 thin walls), a
+         10x10x4 cm tray centred on the body origin. Placed on the table surface, kept
+         inside its 0.8x0.8 m extent (x in [0.16, 0.96], y in [-0.4, 0.4]). -->
+    <body name="green_bin" pos="0.56 0.25 -0.012">
+      <geom type="box" size="0.05 0.05 0.002" pos="0 0 0.002" material="obj_green"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="0.05 0 0.02" material="obj_green"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="-0.05 0 0.02" material="obj_green"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 0.05 0.02" material="obj_green"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 -0.05 0.02" material="obj_green"/>
+    </body>
+
+    <body name="blue_bin" pos="0.56 -0.25 -0.012">
+      <geom type="box" size="0.05 0.05 0.002" pos="0 0 0.002" material="obj_blue"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="0.05 0 0.02" material="obj_blue"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="-0.05 0 0.02" material="obj_blue"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 0.05 0.02" material="obj_blue"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 -0.05 0.02" material="obj_blue"/>
+    </body>
+
+    <body name="yellow_bin" pos="0.80 0 -0.012">
+      <geom type="box" size="0.05 0.05 0.002" pos="0 0 0.002" material="obj_yellow"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="0.05 0 0.02" material="obj_yellow"/>
+      <geom type="box" size="0.002 0.05 0.02" pos="-0.05 0 0.02" material="obj_yellow"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 0.05 0.02" material="obj_yellow"/>
+      <geom type="box" size="0.05 0.002 0.02" pos="0 -0.05 0.02" material="obj_yellow"/>
+    </body>
+
+    <!-- Kept so code that looks the body up still works, though external_cam below no
+         longer targets it (it is a rigid mount now, like LIBERO's). -->
+    <body name="scene_center" pos="0.56 0 -0.012"/>
+
+    <!-- external_cam == LIBERO's `agentview`.
+         LIBERO/robosuite (identical in every libero_*_base_style.xml and robosuite's
+         table_arena.xml):
+             <camera mode="fixed" name="agentview" pos="0.5 0 1.35"
+                     quat="0.653 0.271 0.271 0.653"/>
+         no fovy attribute -> MuJoCo's default 45 degrees. With the table top at 0.800
+         that is an offset of (+0.5, 0, +0.55) from the table centre: 0.743 m standoff,
+         ~45 degrees below horizon, dead-on from the front, framing ~0.60 m.
+
+         Reproduced here as the same offset from OUR table centre (0.56, 0, -0.012):
+             pos = (0.56 + 0.5, 0, -0.012 + 0.55) = (1.06, 0, 0.538)
+         (raised with the table on 2026-07-28 so the framing of the work surface is
+         unchanged. NOTE agentview is per-scene in LIBERO, not canonical: measured
+         link0-relative it is (1.497, 0, 0.650) in libero_object and (1.319, 0, 0.698)
+         in libero_spatial, with different pitches. There is no single right answer to
+         match, so this keeps the framing sec.11 measured the 16 px ball at.)
+         -> view direction (-0.5, 0, -0.55) normalised = (-0.673, 0, -0.740).
+
+         mode="targetbody" is deliberately gone (LIBERO's is mode="fixed").
+
+         xyaxes was NOT hand-derived -- an earlier hand-derivation of the wrist camera got
+         both axes negated, a 180-degree roll that renders upside down while every
+         forward-vector check still passes. These are verified by rendering. -->
+    <camera name="external_cam" pos="1.06 0 0.538" fovy="45"
+            xyaxes="0 1 0  -0.74033 0 0.67224"/>
+  </worldbody>
+</mujoco>

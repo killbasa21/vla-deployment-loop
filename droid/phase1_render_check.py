@@ -9,7 +9,7 @@ import sys
 import mujoco
 from PIL import Image
 
-MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_pick_place.xml"
+MODEL_PATH = "scenes/franka_emika_panda/scene_pick_place.xml"
 
 # sys.argv is the list of command-line arguments; argv[0] is always the script's own
 # path, so argv[1]/argv[2] are the first two arguments *we* pass in. The `if len(...)`

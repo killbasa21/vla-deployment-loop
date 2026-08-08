@@ -38,7 +38,7 @@ from infra.task_spec import INSTRUCTION  # noqa: E402  shared with libero/, act/
 
 json_numpy.patch()
 
-DEFAULT_MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_pick_place.xml"
+DEFAULT_MODEL_PATH = "scenes/franka_emika_panda/scene_pick_place.xml"
 # DROID-matching alternative: FR3 (not Panda) + Robotiq 2F-85, DROID's real rest pose, a table,
 # and droid_put_everything_in_box.py's own object layout (lego duplo / tennis ball / open box)
 # instead of this project's own red-box-and-bins task. See mujoco_menagerie/franka_fr3/
@@ -46,7 +46,7 @@ DEFAULT_MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_pick_place.xml"
 # rest keyframe, box dimensions) was carried over vs. where it had to be re-derived (camera
 # placement, table/pedestal geometry -- ManiSkill's own TableSceneBuilder mesh isn't vendored
 # here) and verified by offscreen rendering instead.
-DROID_MODEL_PATH = "mujoco_menagerie/franka_fr3/scene_droid.xml"
+DROID_MODEL_PATH = "scenes/franka_fr3/scene_droid.xml"
 SERVER_URL = "http://1.193.138.57:34011/act"
 
 # MolmoAct2's own image processor resizes every input image to 378x378 internally

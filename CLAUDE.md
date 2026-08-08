@@ -44,10 +44,12 @@ track; both are short and both are kept current.
 - **`curl /health` before trusting any rollout.** A `modal deploy` that returns in six
   seconds has not necessarily cut over. Confirm the reported checkpoint is the one you
   meant to measure.
-- **Verify plant parameters by compiling the model**, never by reading the XML. The scene
-  files live in the gitignored `mujoco_menagerie/` and have no history; the arm gains were
-  silently reverted once while their explanatory comment stayed in place
-  (`libero/PROGRESS.md` §22).
+- **Verify plant parameters by compiling the model**, never by reading the XML. The rule
+  predates the fix and still holds: the scene files used to live inside the gitignored
+  `mujoco_menagerie/` with no history, and the arm gains were silently reverted once while
+  their explanatory comment stayed in place (`libero/PROGRESS.md` §22). **They now live in
+  tracked `scenes/`** and `mujoco_menagerie/` is a pinned submodule — so a change is at
+  least visible in a diff, but a diff still does not tell you what the model compiled to.
 - **Replay the expert through the inference path before blaming a policy.** That single
   check is what eventually exposed the decimation bug, after nine days of blaming models.
 - **The last checkpoint is not the best one.** Demonstrated twice, on two architectures.
@@ -138,6 +140,10 @@ Three environments, described in full in `README.md` § "Package management":
 
 ## Vendored reference repos
 
-`molmoact2/` and `mujoco_menagerie/` are gitignored clones, not this project's code.
-`molmoact2/CLAUDE.md` documents that repo's own wire protocol and layout if you need the
-server-side schema.
+`molmoact2/` is a gitignored clone, not this project's code. `molmoact2/CLAUDE.md` documents
+that repo's own wire protocol and layout if you need the server-side schema.
+
+`mujoco_menagerie/` is a **pinned submodule** and must stay pristine upstream — never edit a
+file inside it. Our scene XMLs live in tracked `scenes/`; see `scenes/README.md` for the
+`meshdir` rule that makes that possible and for the two files that are deliberate forks of
+upstream (`panda_robotiq.xml`, `scene_base.xml`).

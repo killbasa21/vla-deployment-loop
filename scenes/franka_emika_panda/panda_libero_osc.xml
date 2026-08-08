@@ -1,0 +1,533 @@
+<mujoco model="panda (stock Franka hand, torque actuators, for native OSC)">
+  <!-- ===================================================================
+       THIS FILE = panda_libero_hand.xml WITH TORQUE ACTUATORS ON THE ARM.
+       ===================================================================
+       Everything below this block is panda_libero_hand.xml verbatim; the only change is
+       ADDITION 7 in <actuator> (position servos -> <motor>) and the matching zeroed arm
+       entries in the <keyframe>. Read ADDITION 7 for why.
+
+       Use with scene_libero_osc.xml and `libero_closed_loop.py --control-mode osc`,
+       which runs a port of robosuite's OSC_POSE (libero/osc_controller.py) and writes
+       torques here. Loading this scene in `--control-mode ik` is a hard error: IK mode
+       writes joint angles, which as torques would be violent nonsense.
+
+       panda_libero_hand.xml is NOT edited, so the IK path, the a3/a4 datasets and every
+       logged run stay reproducible -- the same additive rule this whole directory
+       follows.
+
+       NOTE ON THE ARM GAINS. panda_libero_hand.xml's ADDITION 6 documents a `kp x2,
+       kd x0.7` stiffening, but as of 2026-07-28 17:11 the actuator lines in that file
+       read menagerie's STOCK 4500/450 (verified by compiling the model and reading
+       actuator_gainprm, not by reading the XML). The comment and the values disagree,
+       and the file is untracked in this gitignored submodule so there is no history to
+       say which is intended. It does not matter here -- this file has no arm position
+       gains at all -- but it does mean an IK-vs-OSC comparison run today is against a
+       stock-gain Route A, not the stiffened one README.md describes.
+  -->
+  <!-- Panda with the STOCK FRANKA HAND, for libero/libero_closed_loop.py.
+
+       This file is menagerie's upstream panda.xml (i.e. `git show HEAD:panda.xml`)
+       VERBATIM, plus the four marked additions below. It exists because the working
+       panda.xml in this tree has had its stock hand replaced by a Robotiq 2F-85 -- the
+       gripper DROID actually has -- and MolmoAct2-LIBERO was pretrained on robosuite
+       renders of the stock Franka hand. Every difference between the two grippers
+       (finger kinematics, pad shape, pad friction, reported gripper_qpos units, and the
+       eef-site convention) sat directly in the model's observation and action space.
+
+       panda.xml is deliberately NOT edited: the DROID path (phase3_closed_loop.py,
+       phase4_collect_demos.py) and the already-collected dataset both depend on the
+       2F-85 being there. Same additive rule scene_libero.xml follows.
+
+       ADDITIONS, all inside <body name="hand">, all traceable to robosuite 1.5.2:
+         1. `grip_site`  -- LIBERO's `robot0_eef`, position AND frame. See its comment.
+         2. `eye_in_hand` -- robosuite's own wrist camera, copied verbatim.
+         3. pad friction/solref on the fingertip_pad_collision_* classes, matched to
+            robosuite's finger pads.
+       Nothing else in this file differs from upstream. -->
+  <compiler angle="radian" meshdir="../../mujoco_menagerie/franka_emika_panda/assets" autolimits="true"/>
+
+  <option integrator="implicitfast"/>
+
+  <default>
+    <default class="panda">
+      <material specular="0.5" shininess="0.25"/>
+      <joint armature="0.1" damping="1" axis="0 0 1" range="-2.8973 2.8973"/>
+      <general dyntype="none" biastype="affine" ctrlrange="-2.8973 2.8973" forcerange="-87 87"/>
+      <default class="finger">
+        <joint axis="0 1 0" type="slide" range="0 0.04"/>
+      </default>
+
+      <default class="visual">
+        <geom type="mesh" contype="0" conaffinity="0" group="2"/>
+      </default>
+      <default class="collision">
+        <geom type="mesh" group="3"/>
+
+        <!-- ADDITION 3: pad contact parameters matched to robosuite's finger pads.
+             Upstream menagerie leaves these at MuJoCo defaults (friction 1 0.005 0.0001,
+             solref 0.02 1). robosuite's panda_gripper.xml gives BOTH pad geoms:
+                 friction="2 0.05 0.0001"  solref="0.01 0.5"
+             i.e. double the sliding friction, 10x the torsional friction, and a
+             deliberately SOFT, underdamped (zeta=0.5) contact -- squishy pads. Both
+             matter for a sphere grasp, which has no form closure and is held by friction
+             alone. PHASE5_PLAN.md Tier B attributes the "2.0" figure to DROID; it is
+             actually robosuite's, which is the number that counts here.
+
+             priority="1" is OURS, not robosuite's. With equal priorities MuJoCo mixes
+             pairwise (friction elementwise max, solref the stiffer of the two), so the
+             ball's own defaults would partly override the softness we just matched.
+             Priority makes the pad's parameters win outright, which is what reproduces
+             robosuite's behaviour rather than merely copying its numbers. -->
+        <default class="fingertip_pad_collision_1">
+          <geom type="box" size="0.0085 0.004 0.0085" pos="0 0.0055 0.0445"
+            friction="2 0.05 0.0001" solref="0.01 0.5" priority="1"/>
+        </default>
+        <default class="fingertip_pad_collision_2">
+          <geom type="box" size="0.003 0.002 0.003" pos="0.0055 0.002 0.05"
+            friction="2 0.05 0.0001" solref="0.01 0.5" priority="1"/>
+        </default>
+        <default class="fingertip_pad_collision_3">
+          <geom type="box" size="0.003 0.002 0.003" pos="-0.0055 0.002 0.05"
+            friction="2 0.05 0.0001" solref="0.01 0.5" priority="1"/>
+        </default>
+        <default class="fingertip_pad_collision_4">
+          <geom type="box" size="0.003 0.002 0.0035" pos="0.0055 0.002 0.0395"
+            friction="2 0.05 0.0001" solref="0.01 0.5" priority="1"/>
+        </default>
+        <default class="fingertip_pad_collision_5">
+          <geom type="box" size="0.003 0.002 0.0035" pos="-0.0055 0.002 0.0395"
+            friction="2 0.05 0.0001" solref="0.01 0.5" priority="1"/>
+        </default>
+      </default>
+    </default>
+  </default>
+
+  <asset>
+    <material class="panda" name="white" rgba="1 1 1 1"/>
+    <material class="panda" name="off_white" rgba="0.901961 0.921569 0.929412 1"/>
+    <material class="panda" name="black" rgba="0.25 0.25 0.25 1"/>
+    <material class="panda" name="green" rgba="0 1 0 1"/>
+    <material class="panda" name="light_blue" rgba="0.039216 0.541176 0.780392 1"/>
+
+    <!-- Collision meshes -->
+    <mesh name="link0_c" file="link0.stl"/>
+    <mesh name="link1_c" file="link1.stl"/>
+    <mesh name="link2_c" file="link2.stl"/>
+    <mesh name="link3_c" file="link3.stl"/>
+    <mesh name="link4_c" file="link4.stl"/>
+    <mesh name="link5_c0" file="link5_collision_0.obj"/>
+    <mesh name="link5_c1" file="link5_collision_1.obj"/>
+    <mesh name="link5_c2" file="link5_collision_2.obj"/>
+    <mesh name="link6_c" file="link6.stl"/>
+    <mesh name="link7_c" file="link7.stl"/>
+    <mesh name="hand_c" file="hand.stl"/>
+
+    <!-- Visual meshes -->
+    <mesh file="link0_0.obj"/>
+    <mesh file="link0_1.obj"/>
+    <mesh file="link0_2.obj"/>
+    <mesh file="link0_3.obj"/>
+    <mesh file="link0_4.obj"/>
+    <mesh file="link0_5.obj"/>
+    <mesh file="link0_7.obj"/>
+    <mesh file="link0_8.obj"/>
+    <mesh file="link0_9.obj"/>
+    <mesh file="link0_10.obj"/>
+    <mesh file="link0_11.obj"/>
+    <mesh file="link1.obj"/>
+    <mesh file="link2.obj"/>
+    <mesh file="link3_0.obj"/>
+    <mesh file="link3_1.obj"/>
+    <mesh file="link3_2.obj"/>
+    <mesh file="link3_3.obj"/>
+    <mesh file="link4_0.obj"/>
+    <mesh file="link4_1.obj"/>
+    <mesh file="link4_2.obj"/>
+    <mesh file="link4_3.obj"/>
+    <mesh file="link5_0.obj"/>
+    <mesh file="link5_1.obj"/>
+    <mesh file="link5_2.obj"/>
+    <mesh file="link6_0.obj"/>
+    <mesh file="link6_1.obj"/>
+    <mesh file="link6_2.obj"/>
+    <mesh file="link6_3.obj"/>
+    <mesh file="link6_4.obj"/>
+    <mesh file="link6_5.obj"/>
+    <mesh file="link6_6.obj"/>
+    <mesh file="link6_7.obj"/>
+    <mesh file="link6_8.obj"/>
+    <mesh file="link6_9.obj"/>
+    <mesh file="link6_10.obj"/>
+    <mesh file="link6_11.obj"/>
+    <mesh file="link6_12.obj"/>
+    <mesh file="link6_13.obj"/>
+    <mesh file="link6_14.obj"/>
+    <mesh file="link6_15.obj"/>
+    <mesh file="link6_16.obj"/>
+    <mesh file="link7_0.obj"/>
+    <mesh file="link7_1.obj"/>
+    <mesh file="link7_2.obj"/>
+    <mesh file="link7_3.obj"/>
+    <mesh file="link7_4.obj"/>
+    <mesh file="link7_5.obj"/>
+    <mesh file="link7_6.obj"/>
+    <mesh file="link7_7.obj"/>
+    <mesh file="hand_0.obj"/>
+    <mesh file="hand_1.obj"/>
+    <mesh file="hand_2.obj"/>
+    <mesh file="hand_3.obj"/>
+    <mesh file="hand_4.obj"/>
+    <mesh file="finger_0.obj"/>
+    <mesh file="finger_1.obj"/>
+  </asset>
+
+  <worldbody>
+    <light name="top" pos="0 0 2" mode="trackcom"/>
+    <body name="link0" childclass="panda">
+      <inertial mass="0.629769" pos="-0.041018 -0.00014 0.049974"
+        fullinertia="0.00315 0.00388 0.004285 8.2904e-7 0.00015 8.2299e-6"/>
+      <geom mesh="link0_0" material="off_white" class="visual"/>
+      <geom mesh="link0_1" material="black" class="visual"/>
+      <geom mesh="link0_2" material="off_white" class="visual"/>
+      <geom mesh="link0_3" material="black" class="visual"/>
+      <geom mesh="link0_4" material="off_white" class="visual"/>
+      <geom mesh="link0_5" material="black" class="visual"/>
+      <geom mesh="link0_7" material="white" class="visual"/>
+      <geom mesh="link0_8" material="white" class="visual"/>
+      <geom mesh="link0_9" material="black" class="visual"/>
+      <geom mesh="link0_10" material="off_white" class="visual"/>
+      <geom mesh="link0_11" material="white" class="visual"/>
+      <geom mesh="link0_c" class="collision"/>
+      <body name="link1" pos="0 0 0.333">
+        <inertial mass="4.970684" pos="0.003875 0.002081 -0.04762"
+          fullinertia="0.70337 0.70661 0.0091170 -0.00013900 0.0067720 0.019169"/>
+        <joint name="joint1"/>
+        <geom material="white" mesh="link1" class="visual"/>
+        <geom mesh="link1_c" class="collision"/>
+        <body name="link2" quat="1 -1 0 0">
+          <inertial mass="0.646926" pos="-0.003141 -0.02872 0.003495"
+            fullinertia="0.0079620 2.8110e-2 2.5995e-2 -3.925e-3 1.0254e-2 7.04e-4"/>
+          <joint name="joint2" range="-1.7628 1.7628"/>
+          <geom material="white" mesh="link2" class="visual"/>
+          <geom mesh="link2_c" class="collision"/>
+          <body name="link3" pos="0 -0.316 0" quat="1 1 0 0">
+            <joint name="joint3"/>
+            <inertial mass="3.228604" pos="2.7518e-2 3.9252e-2 -6.6502e-2"
+              fullinertia="3.7242e-2 3.6155e-2 1.083e-2 -4.761e-3 -1.1396e-2 -1.2805e-2"/>
+            <geom mesh="link3_0" material="white" class="visual"/>
+            <geom mesh="link3_1" material="white" class="visual"/>
+            <geom mesh="link3_2" material="white" class="visual"/>
+            <geom mesh="link3_3" material="black" class="visual"/>
+            <geom mesh="link3_c" class="collision"/>
+            <body name="link4" pos="0.0825 0 0" quat="1 1 0 0">
+              <inertial mass="3.587895" pos="-5.317e-2 1.04419e-1 2.7454e-2"
+                fullinertia="2.5853e-2 1.9552e-2 2.8323e-2 7.796e-3 -1.332e-3 8.641e-3"/>
+              <joint name="joint4" range="-3.0718 -0.0698"/>
+              <geom mesh="link4_0" material="white" class="visual"/>
+              <geom mesh="link4_1" material="white" class="visual"/>
+              <geom mesh="link4_2" material="black" class="visual"/>
+              <geom mesh="link4_3" material="white" class="visual"/>
+              <geom mesh="link4_c" class="collision"/>
+              <body name="link5" pos="-0.0825 0.384 0" quat="1 -1 0 0">
+                <inertial mass="1.225946" pos="-1.1953e-2 4.1065e-2 -3.8437e-2"
+                  fullinertia="3.5549e-2 2.9474e-2 8.627e-3 -2.117e-3 -4.037e-3 2.29e-4"/>
+                <joint name="joint5"/>
+                <geom mesh="link5_0" material="black" class="visual"/>
+                <geom mesh="link5_1" material="white" class="visual"/>
+                <geom mesh="link5_2" material="white" class="visual"/>
+                <geom mesh="link5_c0" class="collision"/>
+                <geom mesh="link5_c1" class="collision"/>
+                <geom mesh="link5_c2" class="collision"/>
+                <body name="link6" quat="1 1 0 0">
+                  <inertial mass="1.666555" pos="6.0149e-2 -1.4117e-2 -1.0517e-2"
+                    fullinertia="1.964e-3 4.354e-3 5.433e-3 1.09e-4 -1.158e-3 3.41e-4"/>
+                  <joint name="joint6" range="-0.0175 3.7525"/>
+                  <geom mesh="link6_0" material="off_white" class="visual"/>
+                  <geom mesh="link6_1" material="white" class="visual"/>
+                  <geom mesh="link6_2" material="black" class="visual"/>
+                  <geom mesh="link6_3" material="white" class="visual"/>
+                  <geom mesh="link6_4" material="white" class="visual"/>
+                  <geom mesh="link6_5" material="white" class="visual"/>
+                  <geom mesh="link6_6" material="white" class="visual"/>
+                  <geom mesh="link6_7" material="light_blue" class="visual"/>
+                  <geom mesh="link6_8" material="light_blue" class="visual"/>
+                  <geom mesh="link6_9" material="black" class="visual"/>
+                  <geom mesh="link6_10" material="black" class="visual"/>
+                  <geom mesh="link6_11" material="white" class="visual"/>
+                  <geom mesh="link6_12" material="green" class="visual"/>
+                  <geom mesh="link6_13" material="white" class="visual"/>
+                  <geom mesh="link6_14" material="black" class="visual"/>
+                  <geom mesh="link6_15" material="black" class="visual"/>
+                  <geom mesh="link6_16" material="white" class="visual"/>
+                  <geom mesh="link6_c" class="collision"/>
+                  <body name="link7" pos="0.088 0 0" quat="1 1 0 0">
+                    <inertial mass="7.35522e-01" pos="1.0517e-2 -4.252e-3 6.1597e-2"
+                      fullinertia="1.2516e-2 1.0027e-2 4.815e-3 -4.28e-4 -1.196e-3 -7.41e-4"/>
+                    <joint name="joint7"/>
+                    <geom mesh="link7_0" material="white" class="visual"/>
+                    <geom mesh="link7_1" material="black" class="visual"/>
+                    <geom mesh="link7_2" material="black" class="visual"/>
+                    <geom mesh="link7_3" material="black" class="visual"/>
+                    <geom mesh="link7_4" material="black" class="visual"/>
+                    <geom mesh="link7_5" material="black" class="visual"/>
+                    <geom mesh="link7_6" material="black" class="visual"/>
+                    <geom mesh="link7_7" material="white" class="visual"/>
+                    <geom mesh="link7_c" class="collision"/>
+                    <body name="hand" pos="0 0 0.107" quat="0.9238795 0 0 -0.3826834">
+                      <inertial mass="0.73" pos="-0.01 0 0.03" diaginertia="0.001 0.0025 0.0017"/>
+                      <geom mesh="hand_0" material="off_white" class="visual"/>
+                      <geom mesh="hand_1" material="black" class="visual"/>
+                      <geom mesh="hand_2" material="black" class="visual"/>
+                      <geom mesh="hand_3" material="white" class="visual"/>
+                      <geom mesh="hand_4" material="off_white" class="visual"/>
+                      <geom mesh="hand_c" class="collision"/>
+
+                      <!-- ADDITION 1: LIBERO's `robot0_eef`.
+                           robosuite builds it as
+                               right_hand -> right_gripper (quat 0.707107 0 0 -0.707107)
+                                          -> body "eef" (pos 0 0 0.097, quat identity)
+                                          -> site "grip_site"
+                           This body IS robosuite's right_hand (menagerie mounts the hand
+                           at pos 0 0 0.107 quat 0.9238795 0 0 -0.3826834; robosuite at
+                           0 0 0.1065 quat 0.924 0 0 -0.383 -- the same frame to rounding),
+                           so the whole chain collapses to one site here.
+
+                           CORRECTED 2026-07-28 against a live LIBERO env, replacing two
+                           values that had been derived from reading robosuite's XML
+                           rather than measuring it. Both were wrong. At LIBERO's own
+                           reset joints the live env reports its eef at (0.4515, 0,
+                           0.2613) relative to link0 with axis-angle (3.1408, 0.0018,
+                           -0.0899); a yaw sweep against that ground truth gives:
+
+                               pos 0.097  quat identity   -> 0.5 mm, 0.002 rad   <- this
+                               pos 0.097  quat Rz(-90)    -> 0.5 mm, 2.418 rad
+                               pos 0.097  quat Rz(+90)    -> 0.5 mm, 5.842 rad
+
+                           So the frame needs NO extra rotation: menagerie's -45 deg hand
+                           mount and robosuite's right_gripper chain already land on the
+                           same frame, and the Rz(-90) that used to be here was a spurious
+                           90 deg yaw applied to every eef_axisangle we ever reported.
+
+                           POS is robosuite's literal 0.097. The previous 0.1065 came from
+                           trying to preserve a pad-centre RELATIONSHIP (menagerie's pad
+                           centre sits 9.5 mm further out than robosuite's), but that
+                           traded a 9.5 mm error in the reported eef height -- which is
+                           what the model conditions on and servos to -- for a 9.5 mm
+                           correction to pad geometry, which only our own clamp heuristics
+                           read. Matching the reported state to the training distribution
+                           wins; the pad offset is handled in the clamp instead. -->
+                      <site name="grip_site" pos="0 0 0.097"
+                        type="sphere" size="0.005" group="5" rgba="0.9 0.9 0.9 1"/>
+
+                      <!-- ADDITION 2: robosuite's own wrist camera, copied verbatim from
+                           robosuite/models/assets/robots/panda/robot.xml:224, where it
+                           sits in right_hand == this body:
+                               <camera mode="fixed" name="eye_in_hand" pos="0.05 0 0"
+                                       quat="0 0.707108 0.707108 0" fovy="75"/>
+                           This is LIBERO's `robot0_eye_in_hand`, the second image the
+                           checkpoint was trained on. It replaces the 22 cm side-mount at
+                           fovy 56.7 in panda.xml, which was OUR design and never matched
+                           anything (PROGRESS.md "Still open"). Copied rather than
+                           re-derived on purpose -- see PROGRESS.md sec.8 on what
+                           hand-deriving a camera orientation cost last time. -->
+                      <camera mode="fixed" name="eye_in_hand" pos="0.05 0 0"
+                        quat="0 0.707108 0.707108 0" fovy="75"/>
+
+                      <body name="left_finger" pos="0 0 0.0584">
+                        <inertial mass="0.015" pos="0 0 0" diaginertia="2.375e-6 2.375e-6 7.5e-7"/>
+                        <joint name="finger_joint1" class="finger"/>
+                        <geom mesh="finger_0" material="off_white" class="visual"/>
+                        <geom mesh="finger_1" material="black" class="visual"/>
+                        <!-- ADDITION 4: stiffen the finger body's contact.
+                             This mesh, NOT the fingertip pads, is the geom that reaches
+                             the table first, and inheriting class="collision" left it at
+                             MuJoCo's default solref="0.02 1" -- a 20 ms, i.e. soft,
+                             contact. Measured 2.9 mm of real penetration under the ~70 N
+                             a position servo presses with, against 0.5 mm for the Robotiq
+                             pads it replaced (solref="0.004 1"). robosuite gets away with
+                             the soft default because its OSC is force-based and yields;
+                             Route A does not, so the softness shows up as the gripper
+                             visibly sinking into the table. Matched to the stiffness the
+                             2F-85 had. -->
+                        <geom mesh="finger_0" class="collision" solref="0.004 1"/>
+                        <geom class="fingertip_pad_collision_1"/>
+                        <geom class="fingertip_pad_collision_2"/>
+                        <geom class="fingertip_pad_collision_3"/>
+                        <geom class="fingertip_pad_collision_4"/>
+                        <geom class="fingertip_pad_collision_5"/>
+                      </body>
+                      <body name="right_finger" pos="0 0 0.0584" quat="0 0 0 1">
+                        <inertial mass="0.015" pos="0 0 0" diaginertia="2.375e-6 2.375e-6 7.5e-7"/>
+                        <joint name="finger_joint2" class="finger"/>
+                        <geom mesh="finger_0" material="off_white" class="visual"/>
+                        <geom mesh="finger_1" material="black" class="visual"/>
+                        <!-- ADDITION 4: stiffen the finger body's contact.
+                             This mesh, NOT the fingertip pads, is the geom that reaches
+                             the table first, and inheriting class="collision" left it at
+                             MuJoCo's default solref="0.02 1" -- a 20 ms, i.e. soft,
+                             contact. Measured 2.9 mm of real penetration under the ~70 N
+                             a position servo presses with, against 0.5 mm for the Robotiq
+                             pads it replaced (solref="0.004 1"). robosuite gets away with
+                             the soft default because its OSC is force-based and yields;
+                             Route A does not, so the softness shows up as the gripper
+                             visibly sinking into the table. Matched to the stiffness the
+                             2F-85 had. -->
+                        <geom mesh="finger_0" class="collision" solref="0.004 1"/>
+                        <geom class="fingertip_pad_collision_1"/>
+                        <geom class="fingertip_pad_collision_2"/>
+                        <geom class="fingertip_pad_collision_3"/>
+                        <geom class="fingertip_pad_collision_4"/>
+                        <geom class="fingertip_pad_collision_5"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+
+  <tendon>
+    <fixed name="split">
+      <joint joint="finger_joint1" coef="0.5"/>
+      <joint joint="finger_joint2" coef="0.5"/>
+    </fixed>
+  </tendon>
+
+  <equality>
+    <joint joint1="finger_joint1" joint2="finger_joint2" solimp="0.95 0.99 0.001" solref="0.005 1"/>
+  </equality>
+
+  <actuator>
+    <!-- ADDITION 6 (2026-07-28): arm gains kp x2, kd x0.7 vs menagerie's stock
+         (4500/-450, 3500/-350, 2000/-200).
+
+         WHY. Menagerie tunes these for a free-standing arm, and the result is heavily
+         OVERDAMPED: with an effective joint inertia around 2.5 kg m^2, kp=4500 kd=450
+         gives zeta ~ 2.1, so the dominant time constant is tau ~ 0.15 s against a 0.05 s
+         control tick. The arm therefore realises only ~33% of each commanded delta and
+         sits at a standing gravity sag. Because the collector labels every tick with
+         (target - current)/DELTA_POS_SCALE, that sag is written into EVERY training
+         label as a constant offset -- measured +0.174 on dx and +0.127 on dz in the a1
+         dataset, against a released LIBERO distribution that is symmetric about zero.
+         Worse, it made dx one-sided (q01 = -0.08 over 8700 frames), so the data carried
+         no signal for retreating in -x.
+
+         This is not fixable by slowing the reference trajectory -- measured, that makes
+         the ratio WORSE (0.32 -> 0.15 at 0.25x speed), because the sag is static and
+         does not scale with reference velocity while the commanded motion does.
+
+         WHY THIS IS A MOVE TOWARD LIBERO, NOT AWAY. LIBERO drives the Panda with
+         robosuite's OSC, a force-based controller that tracks its Cartesian setpoint
+         tightly. Our stiff-IK Route A stand-in tracking only a third of its setpoint is
+         the artefact; making it actually arrive is closer to the plant the checkpoint
+         was trained against, not further from it.
+
+         MEASURED, 8 episodes/config, reach + noise (probe_gains.py):
+           config       placed  realised/commanded  mean_dx  q01_dx  clip%  table_Fn
+           baseline      5/8          0.355          0.142   -0.075  0.34     0.0 N
+           kp2 kd0.7     4/8          0.724          0.084   -0.181  0.17     0.0 N   <- this
+           kp3 kd0.6     4/8          0.899          0.077   -0.243  0.65     0.0 N
+           kp4 kd0.5     4/8          0.980          0.097   -0.258  1.05     0.0 N
+           kp6 kd0.45    4/8          1.040          0.121   -0.333  1.60     0.0 N
+         Stiffer than kp2 starts to ring: mean_dx turns back UP past kp3 and dz begins
+         saturating at 1.000. kp2 kd0.7 is the knee -- it halves the bias, more than
+         doubles tracking, has the LOWEST clipping of any config tested, and is the first
+         config where dx is meaningfully two-sided. Task success is unchanged within the
+         sample. Contact into the table stays at 0 N because --min-clearance still holds
+         the commanded target above the surface.
+
+         IT ALSO HALVES THE STATIC SAG AT RESET, which is a second, independent win.
+         eef height above the table at LIBERO's reset joints, table top = 0.9000:
+           pure forward kinematics, no dynamics   0.2728
+           stock  kp4500 kd450                    0.2680   sag 4.84 mm
+           this   kp9000 kd315                    0.2704   sag 2.44 mm
+           (x4    kp18000 kd225                   0.2716   sag 1.23 mm)
+         LIBERO's measured value is 0.2733. Note that libero/README.md and
+         fine_tune/README.md both quote "ours 0.2728" against that, a claimed 0.5 mm
+         match -- but 0.2728 is the PURE FK number. The pose the arm actually settles at
+         and starts every episode from was 0.2680, a 5.3 mm error. This change takes it
+         to 2.9 mm.
+
+         NOTE: this changes the plant, so it changes libero_closed_loop.py at inference
+         too. That is REQUIRED, not incidental -- the collector's whole design rule is
+         that labels are produced through the same controller that will consume them.
+         It also means a1/ and a2/ were collected on the old plant and are superseded by
+         a3/. panda.xml is untouched, so the DROID path is unaffected. -->
+    <!-- ADDITION 7 (2026-07-28): TORQUE actuators, replacing the position servos.
+
+         THIS IS THE WHOLE POINT OF THIS FILE. LIBERO drives the Panda through
+         robosuite's OSC_POSE, which computes joint TORQUES and writes them to
+         `<motor>` actuators (robosuite/models/assets/robots/panda/robot.xml):
+
+             <motor ctrllimited="true" ctrlrange="-80.0 80.0" joint="joint1" .../>
+             ...
+             <motor ctrllimited="true" ctrlrange="-12.0 12.0" joint="joint7" .../>
+
+         So in LIBERO, `data.ctrl[0:7]` is torque in N.m. In panda_libero_hand.xml it is
+         a JOINT ANGLE in radians, because those are `biastype="affine"` position
+         servos. Same array, different physical quantity. Route A bridged the gap with
+         a DLS IK solve; this file removes the need for one.
+
+         WHY THAT MATTERS, beyond fidelity. Three separate problems in this project are
+         artefacts of the position servo, not of the policy:
+           1. NO COMPLIANCE. A position servo drives to its target regardless of
+              contact (PROGRESS sec.19: 2.9 mm of real penetration by the finger mesh
+              under ~70 N). --min-clearance exists purely to fake the yielding that a
+              force controller gets for free.
+           2. SERVO DROOP. An overdamped position servo never arrives, so the collector's
+              (target - current) label carries a standing sag -- see README.md, which is
+              entirely about that bug. A torque controller has no joint setpoint to lag
+              behind, so the whole failure class disappears.
+           3. IK NON-CONVERGENCE. `IK unreached 10/10` appears in the two failing runs of
+              README sec.9. OSC has no convergence criterion; near a singularity the
+              commanded wrench simply falls off.
+
+         CTRLRANGE IS ROBOSUITE'S, NOT FRANKA'S. Real Panda limits are 87 N.m on joints
+         1-4 and 12 N.m on joints 5-7; menagerie encodes exactly that. robosuite uses
+         80/80/80/80/80/12/12 -- i.e. it is wrong about joint 5, allowing 80 N.m where
+         the hardware permits 12. We copy robosuite anyway, on this file's standing rule:
+         reproduce what the checkpoint was TRAINED against, not what the datasheet says.
+         Deviating here would be a silent plant difference of exactly the kind that has
+         cost this project the most time.
+
+         The `class="panda"` attribute is deliberately dropped. That class defines
+         `<general dyntype="none" biastype="affine" ctrlrange="-2.8973 2.8973"
+         forcerange="-87 87"/>`, i.e. the position-servo defaults -- inheriting it here
+         would silently re-impose a radian ctrlrange on a torque actuator. -->
+    <motor name="actuator1" joint="joint1" ctrllimited="true" ctrlrange="-80 80"/>
+    <motor name="actuator2" joint="joint2" ctrllimited="true" ctrlrange="-80 80"/>
+    <motor name="actuator3" joint="joint3" ctrllimited="true" ctrlrange="-80 80"/>
+    <motor name="actuator4" joint="joint4" ctrllimited="true" ctrlrange="-80 80"/>
+    <motor name="actuator5" joint="joint5" ctrllimited="true" ctrlrange="-80 80"/>
+    <motor name="actuator6" joint="joint6" ctrllimited="true" ctrlrange="-12 12"/>
+    <motor name="actuator7" joint="joint7" ctrllimited="true" ctrlrange="-12 12"/>
+    <!-- Remap original ctrlrange (0, 0.04) to (0, 255): 0.04 * 100 / 255 = 0.01568627451 -->
+    <!-- ADDITION 5 (2026-07-28): forcerange -100..100 -> -20..20, robosuite's own value
+         (panda_gripper.xml: `forcelimited="true" forcerange="-20 20"` on each finger).
+         Menagerie's 100 N is 5x that. Changed on the same principle as the rest of this
+         file -- use robosuite's number, not menagerie's -- but be aware it is NOT load
+         bearing: swapping it produced bit-identical trajectories, because at a seated
+         grasp the tendon is only pulling a few newtons and never reaches either limit.
+         The ball-extrusion problem it was reached for turned out to be contact softness,
+         and is fixed on the ball geom in the scene file instead. -->
+    <general class="panda" name="actuator8" tendon="split" forcerange="-20 20" ctrlrange="0 255"
+      gainprm="0.01568627451 0 0" biasprm="0 -100 -10"/>
+  </actuator>
+
+  <keyframe>
+    <!-- ctrl[0:7] is now TORQUE, so the home keyframe's arm entries must be 0, not the
+         joint angles panda_libero_hand.xml pairs here. Copying that keyframe verbatim
+         would command -1.57 N.m on joint 4 at reset -- small, constant, and exactly the
+         kind of thing that looks like a controller bug for a week. ctrl[7] (gripper) is
+         unchanged: that actuator is still position-driven, 255 = open. -->
+    <key name="home" qpos="0 0 0 -1.57079 0 1.57079 -0.7853 0.04 0.04" ctrl="0 0 0 0 0 0 0 255"/>
+  </keyframe>
+
+  <contact>
+    <exclude body1="link0" body2="link1"/>
+  </contact>
+</mujoco>

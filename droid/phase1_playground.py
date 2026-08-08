@@ -20,7 +20,7 @@ import glfw
 import mujoco
 import mujoco.viewer
 
-MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_playground.xml"
+MODEL_PATH = "scenes/franka_emika_panda/scene_playground.xml"
 
 # Every body we made draggable (freejoint in the XML) -- kept as an explicit list here
 # so print_positions() below knows which bodies to report on.

@@ -41,7 +41,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from infra.task_spec import INSTRUCTION  # noqa: E402  shared with libero/, act/, smolvla_libero/
 
-MODEL_PATH = "mujoco_menagerie/franka_emika_panda/scene_pick_place.xml"
+MODEL_PATH = "scenes/franka_emika_panda/scene_pick_place.xml"
 
 # Gripper conventions. The Panda mounts a Robotiq 2F-85 (see panda.xml). Its
 # fingers_actuator takes ctrl in 0-255 (0=open, 255=closed). MolmoAct2-DROID's gripper

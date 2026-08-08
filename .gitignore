@@ -9,9 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
-# Vendored repos (cloned for reference, not part of this project)
-mujoco_menagerie/
+# Vendored reference repo, not part of this project.
 molmoact2/
+
+# mujoco_menagerie is a pinned SUBMODULE, not a gitignored clone. Our own scene XMLs used
+# to live inside it, untracked and with no history -- which cost one silent revert of the
+# arm gains. They now live in scenes/ and the submodule stays pristine upstream.
 
 # Per-run debug artifacts (camera frames + jsonl logs) -- see CLAUDE.md.
 # Bulky and regenerated every run; previously committed by accident and had

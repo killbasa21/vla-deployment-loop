@@ -251,7 +251,7 @@ Carried over from the DROID loop, both now wrong by default:
 
 ## Scene: `scene_libero_hand.xml`
 
-Uses `mujoco_menagerie/franka_emika_panda/scene_libero_hand.xml`, **not**
+Uses `scenes/franka_emika_panda/scene_libero_hand.xml`, **not**
 `scene_pick_place.xml`. Same objects; `external_cam` is re-framed to LIBERO's `agentview`
 (0.707 m standoff, `fovy 45`, rigid `xyaxes` mount instead of `mode="targetbody"`).
 
