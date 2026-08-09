@@ -324,10 +324,10 @@ every episode, so the green one has to be read off the image.
 
 Watch the `grip` bar on the failure. The policy gets to the box and closes, but the wrist is
 rotated wrong at the moment it closes, so the box squirts out and it spends the rest of the
-episode retrying. That is 16 of 25 episodes: not lost, not confused about which tray is green —
-just stuck re-attempting a grasp it keeps getting slightly wrong.
+episode retrying. That is 16 of 25 episodes — not lost, not confused about which tray is green,
+just re-attempting a grasp it keeps getting slightly wrong.
 
-Three findings came out of comparing them.
+Four findings:
 
 **The gripper was a channel nobody taught.** Across 20 MolmoAct2 rollouts, every single lift
 and every single placement came from a run in which the gripper closed *at all* — and it
@@ -352,13 +352,11 @@ that rule went ragged — even as its motion got smoother and its grasps got tig
 3 k checkpoint beat its 5 k one. The unfreeze sweep peaked at its very first checkpoint.
 **Score intermediate checkpoints.**
 
-One more, found by accident: **the scorer itself was wrong.** A run reported `placed 32%` and
-`released 8%`, which is impossible — you have to let go before it counts as placed. `released`
-was being recorded the *first* time the gripper lost contact, and contact flickers during
-transport. Once it was changed to the last let-go, the numbers lined up.
-
-> **Lesson:** build the metric as a chain where each stage requires the one before it, then
-> look for totals that can't happen.
+**A metric should be able to catch itself.** The scorer grades success as a chain — grasp, then
+lift, then place, then release — where each stage requires the one before it. That structure is
+what surfaced `placed 32%` against `released 8%`: an impossible pair, since letting go is a
+precondition for placing. `released` was keyed to the *first* loss of contact, and contact
+flickers during transport. Keyed to the last let-go, the numbers reconciled.
 
 ## 8. What's next
 
