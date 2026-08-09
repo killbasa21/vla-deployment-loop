@@ -362,6 +362,15 @@ transport. Once it was changed to the last let-go, the numbers lined up.
 
 ## 8. What's next
 
+**Move the simulation to Isaac Sim.** The very first result in this project was a model failing
+because a flat-shaded MuJoCo render looks nothing like the real-robot video it was pretrained on
+(§5.1). Everything since has worked *around* that gap — picking checkpoints pretrained in
+simulation, rebuilding the scene to match their conventions. Isaac Sim attacks it directly:
+ray-traced rendering, real materials and lighting, physically-based cameras. The experiment is
+to put the same policies on top of a photorealistic version of this task and see how much of
+the appearance gap was doing the damage — and whether a checkpoint trained on real robots
+becomes usable once the pixels stop giving the simulator away.
+
 **Fine-tune the VLM properly.** The unfreeze experiment failed, but it failed on 40 episodes.
 The question of whether the vision-language stack can be adapted rather than damaged is still
 open, and 300+ demos is the setting to ask it in.
