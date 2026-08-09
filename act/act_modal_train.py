@@ -58,6 +58,7 @@ import modal
 # module inside the container -- where infra/ lands on /root via with_infra().
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from infra.modal_images import lerobot_train_image, with_infra
+from infra.task_spec import DATA_NAMESPACE
 
 # a7: 60 episodes, 20034 frames, 334 ticks/ep, --delta-pos-scale 0.10, shuffled bins.
 #
@@ -70,8 +71,9 @@ from infra.modal_images import lerobot_train_image, with_infra
 # THE SERVING CLIENT MUST RUN `--delta-pos-scale 0.10 --randomize-bins` or the rollout is not
 # measuring this dataset.
 DATASET_DIR = "libero/fine_tune/a7"          # uploaded as-is; no conversion step exists
-REMOTE_REPO = "/data/greenbox/green_ball_a7_act"   # its own path -- an overwritten volume
-                                                   # repo removes the ability to A/B runs
+REMOTE_REPO = f"/data/{DATA_NAMESPACE}/green_ball_a7_act"  # its own path -- an overwritten
+                                                           # volume repo removes the ability
+                                                           # to A/B runs
 
 # Same base layers as smolvla_modal_train.py so the heavy torch pull is a CACHE HIT rather
 # than a 15-25 minute rebuild. `[smolvla]` is NOT needed for ACT, but dropping it here would
@@ -228,7 +230,7 @@ def train(max_steps: int = 60000, batch_size: int = 16, save_freq: int = 10000,
         # No --policy.path: from scratch. The only pretrained weights are the backbone's
         # ImageNet initialisation, which ACTConfig sets by default.
         "--policy.type=act",
-        f"--dataset.repo_id=greenbox/{REMOTE_REPO.rsplit('/', 1)[-1]}",
+        f"--dataset.repo_id={DATA_NAMESPACE}/{REMOTE_REPO.rsplit('/', 1)[-1]}",
         f"--dataset.root={REMOTE_REPO}",
         f"--output_dir={out_dir}",
         f"--job_name={exp_name}",

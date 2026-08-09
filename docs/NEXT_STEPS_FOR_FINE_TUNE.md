@@ -9,7 +9,7 @@ you, not for the agent.
 ## The prompt
 
 ```
-Work in /home/hardik/Desktop/greenbox. Goal: fine-tune allenai/MolmoAct2-LIBERO so a
+Work in the repo root. Goal: fine-tune allenai/MolmoAct2-LIBERO so a
 simulated Franka Panda picks up a green ball and places it in the green container.
 
 STEP 1 — READ FIRST, IN THIS ORDER

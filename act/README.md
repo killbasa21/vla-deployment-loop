@@ -209,7 +209,9 @@ of frames. Details and the collection OOM in `PROGRESS.md` §5.
 
 **P1 — upload + smoke.** `::upload` pushes `a7` to the `molmoact2-lerobot-data` volume under
 its own path (`/data/greenbox/green_ball_a7_act` — never overwrite another run's repo, that
-removes the ability to A/B). Then `--max-steps 1 --save-freq 1`, per CLAUDE.md's smoke rule:
+removes the ability to A/B). The `greenbox` level is `DATA_NAMESPACE` in
+[`infra/task_spec.py`](../infra/task_spec.py); set the env var of the same name to point a
+run at a volume laid out under a different prefix. Then `--max-steps 1 --save-freq 1`, per CLAUDE.md's smoke rule:
 one optimizer step and one checkpoint save proves build → load → step → save, and every
 further step is money for no signal.
 

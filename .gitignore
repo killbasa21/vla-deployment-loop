@@ -45,3 +45,7 @@ libero/fine_tune/[a-z][0-9]*/**
 
 # Agent tooling, not part of this project.
 .agents/
+
+# Locally unpacked AWS CLI installer -- 340 MB of vendor binaries, not project code.
+aws/
+awscliv2.zip

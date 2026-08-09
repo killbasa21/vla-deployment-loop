@@ -95,6 +95,7 @@ import modal
 # module inside the container -- where infra/ lands on /root via with_infra().
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from infra.modal_images import lerobot_train_image, with_infra
+from infra.task_spec import DATA_NAMESPACE
 
 # a7, the third dataset in this sequence, and the reason for each move is worth keeping:
 #
@@ -113,9 +114,10 @@ from infra.modal_images import lerobot_train_image, with_infra
 # NOTE the serving client must run --delta-pos-scale 0.10 to match, and --randomize-bins,
 # since a7 shuffles the bin layout every episode.
 DATASET_DIR = "smolvla_libero/data/a7_smolvla"   # local, produced by convert_dataset.py
-REMOTE_REPO = "/data/greenbox/green_ball_a7"     # its own path, like a6 got its own: an
-                                                 # overwritten volume repo leaves no way to
-                                                 # A/B the datasets against each other.
+REMOTE_REPO = f"/data/{DATA_NAMESPACE}/green_ball_a7"  # its own path, like a6 got its own:
+                                                       # an overwritten volume repo leaves no
+                                                       # way to A/B the datasets against
+                                                       # each other.
 BASE_CHECKPOINT = "HuggingFaceVLA/smolvla_libero"
 
 # ---------------------------------------------------------------------------------------
@@ -417,7 +419,7 @@ def train(mode: str = "lora", max_steps: int = 3000, batch_size: int = 16,
     cmd = [
         "lerobot-train",
         f"--policy.path={BASE_CHECKPOINT}",
-        f"--dataset.repo_id=greenbox/{dataset_root.rsplit('/', 1)[-1]}",
+        f"--dataset.repo_id={DATA_NAMESPACE}/{dataset_root.rsplit('/', 1)[-1]}",
         f"--dataset.root={dataset_root}",
         f"--output_dir={out_dir}",
         f"--job_name={exp_name}",

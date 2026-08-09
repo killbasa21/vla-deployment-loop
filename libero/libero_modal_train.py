@@ -83,6 +83,7 @@ import modal
 # module inside the container -- where infra/ lands on /root via with_infra().
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from infra.modal_images import molmoact_experiments_image, with_infra
+from infra.task_spec import DATA_NAMESPACE
 
 # Same image recipe as droid/phase4_modal_train.py -- the training package pins
 # transformers>=5.3, a different pin from the inference server's 4.57, so this cannot
@@ -92,8 +93,8 @@ image = with_infra(
         "LEROBOT_DATA_ROOT": "/data",
         "LEROBOT_VIDEO_BACKEND": "pyav",
         "WANDB_MODE": "disabled",
-        "WANDB_PROJECT": "greenbox-libero-green-ball",
-        "WANDB_ENTITY": "greenbox",
+        "WANDB_PROJECT": f"{DATA_NAMESPACE}-libero-green-ball",
+        "WANDB_ENTITY": DATA_NAMESPACE,
     })
     .pip_install("debugpy")  # train_lerobot.py imports it unconditionally
 )
@@ -106,7 +107,7 @@ app = modal.App("molmoact2-libero-train")
 
 START_CHECKPOINT = "allenai/MolmoAct2-LIBERO"
 DEFAULT_MIXTURE = "libero_green_ball"
-REPO_PATH = "/data/greenbox/libero_green_ball"
+REPO_PATH = f"/data/{DATA_NAMESPACE}/libero_green_ball"
 
 
 @app.function(
@@ -165,7 +166,7 @@ def train(mode: str = "lora", gpus: int = 1, max_steps: int = 400,
         raise FileNotFoundError(
             f"{stats_path} missing. Upload the dataset first:\n"
             f"  modal volume put molmoact2-lerobot-data libero/fine_tune/a4 "
-            f"/greenbox/libero_green_ball")
+            f"{REPO_PATH.removeprefix('/data')}")
     stats = json.load(open(stats_path))
     print("dataset action q01:", [round(v, 3) for v in stats["action"]["q01"]], flush=True)
     print("dataset action q99:", [round(v, 3) for v in stats["action"]["q99"]], flush=True)
