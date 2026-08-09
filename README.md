@@ -1,10 +1,39 @@
 # vla-deployment-loop
 
-**One robot task. Twelve policies. The one that works is the smallest.**
+**The question: can a pretrained vision-language-action model be adapted to a task outside its
+training distribution — and what does it cost to find out?**
+
+Three published checkpoints were taken off the shelf and pushed at one task in a simulator none
+of them was pretrained on: MolmoAct2-DROID (trained on video of *real* robots), MolmoAct2-LIBERO
+(5.57 B, trained on simulated Pandas) and SmolVLA-450M. Everything around them is the second
+half of the question — the full deployment loop, built from scratch: scene, scripted expert,
+dataset, training, a GPU policy server, and a scorer strict enough to be believed.
+
+**The answer so far is: not on this budget, and the interesting part is why.** Fine-tuning the
+big pretrained models onto this task produced 1/10 and 2/10 — but that is not a ceiling, it is
+a receipt. On free Modal credits a LoRA run bought **150 steps, or 0.06 epochs** of the dataset,
+and a single checkpoint save ate 4% of the budget. At 0.06 epochs the weights have barely moved;
+the risk isn't overfitting, it's that no training happened at all. A real answer to the
+adaptation question needs an order of magnitude more compute than a free tier hands out.
+
+What *did* work, on the same hardware, points at where to look next: a **51.6 M model with no
+pretraining whatsoever** placed the object 5 times in 6, and the *small* pretrained model hit
+36% once it was given 300 demos in a scene rebuilt to match its own pretraining conventions.
+So the binding constraints here were compute, data volume, and how far the scene sat from what
+the checkpoint already knew — not model capacity. Every one of those is movable, and
+[§8](#8-whats-next) lists the experiments that would move them: a properly funded VLM
+fine-tune, more demos, a patch-based policy, and reinforcement learning on top of behaviour
+cloning to get past what the scripted expert can show.
+
+Two of the early "the model failed" results turned out to be bugs in our own harness that were
+scoring a *perfect* policy as zero. That is the other reason to read this as unfinished rather
+than settled.
+
+**One robot task. Twelve scored configurations. The one that works is the smallest.**
 
 The task: *pick up the green box and put it in the green container.* The box and the
 container move to random spots every episode. A run only counts if the box ends up in the
-container — getting close doesn't count.
+container — near misses score zero.
 
 > **The target used to be a ball.** For most of this project it was a 40 mm green sphere and
 > the instruction said *"green ball"*. It was changed to a 40 mm cube, and the instruction
@@ -30,11 +59,11 @@ Nothing about the model runs locally. The laptop only simulates and draws.
 ## 2. The loop
 
 ```
- ┌──────────── local (this repo) ─────────────┐        ┌──── Modal GPU ────┐
+ ┌──────────── local (this repo) ─────────────┐        ┌──── Modal GPU ─────┐
  │ MuJoCo: Franka Panda + green box + bins    │  HTTP  │ policy server      │
  │  - renders external_cam + wrist_cam        │ ─────► │ POST /act          │
- │  - reads proprioception                    │  JSON  │ in:  images,       │
- │  - applies the returned action chunk       │ ◄───── │      instruction,  │
+ │  - reads proprioception                    │  JSON  │ in:  2 images,     │
+ │  - applies the returned action chunk       │ ◄───── │      state, prompt │
  │  - steps physics, logs every chunk         │        │ out: (N, 8) chunk  │
  └────────────────────────────────────────────┘        └────────────────────┘
 ```
@@ -46,6 +75,36 @@ the only reason a remote GPU is usable at 20 Hz.
 
 Every policy in this repo speaks that same contract. Same client, same scorer, same wire
 format. Only the server changes.
+
+**Why Modal for the right-hand box.** The laptop has no GPU that can hold a 5.57 B checkpoint,
+and buying one to answer a question that might take an afternoon is the wrong trade. Modal
+rents an L4 or an H100 per second, bills nothing while idle, and takes the same Python image
+definition for both training and serving — so the checkpoint a run trains is served from the
+identical environment, which removes a whole class of "works in training" bug. It also forces
+the split above to be real: the moment the policy lives behind HTTP, the simulator cannot
+accidentally reach into it, and swapping policies becomes a redeploy rather than a rewrite.
+
+### The parts that had to be built
+
+Neither box in that diagram came off a shelf. About 10 k lines sit between "download a
+checkpoint" and "get a number you can trust", and most of the project's lessons are lodged in
+them:
+
+| piece | what it does, and why it exists |
+|---|---|
+| `libero/libero_closed_loop.py` | the client. Renders both cameras, packs the request, plays the returned chunk out against physics, and streams a JSONL log plus every frame to disk *as the run proceeds*, so a rollout can be watched live and re-scored later |
+| `libero/osc_controller.py` | operational-space control, ported from robosuite 1.4.0 to raw MuJoCo. This is what makes our action space the *same* 7-D delta pose the checkpoints were pretrained on rather than a lookalike — and replacing position actuators with it is what took controller sag from 4.84 mm to 0.000 mm |
+| `libero/tools/verify_osc.py` | standalone controller checks. No GPU, no Modal, no inference, so it is free to re-run and is meant to be run after every change to the controller or the arm XML |
+| `scenes/` + `libero/fine_tune/collect_finetune_data.py` | the scene, the scripted expert, the randomisation and the rejection sampling — every demonstration in the project comes from here |
+| `libero/fine_tune/lerobot_v30_writer.py` | a LeRobot **v3.0** writer shaped to match the released MolmoAct2-LIBERO dataset. The obvious writer emits v2.1 with mp4 video features, which is the wrong format twice over for this checkpoint |
+| `pin_released_stats.py` / `rebuild_stats.py` | normalisation statistics. Get these wrong and the trainer silently rebuilds the normaliser from our data instead of inheriting the pretrained one — no error, just a policy fine-tuned in the wrong units |
+| `smolvla_libero/convert_dataset.py` | re-keys a dataset into SmolVLA's own naming conventions. Feeding a model camera keys it never saw is a silent failure, not a crash |
+| `libero/score_runs.py` | the scorer. Reads logs rather than watching rollouts, takes whole directories at once, and grades success as a chain — grasp, then lift, then place, then release — so an impossible total exposes a broken metric |
+| `infra/modal_images.py` | every Modal image, defined once. The torch pin used to live in five chains that were meant to share a multi-GB layer and silently stopped the moment one drifted |
+| `infra/task_spec.py` | the instruction string, the target's names in the scene, and the data namespace. Each was copy-pasted across five files until it wasn't |
+| `libero_modal.py`, `act_modal.py`, `smolvla_modal.py` | three policy servers, one `POST /act` contract. Each reports its own checkpoint on `/health`, which is the only way to know the deploy you just ran actually cut over |
+| `greenbox/` | the task rebuilt from scratch — its own env, expert, metrics and Modal app — after the first version had accumulated too many assumptions to trust |
+| `scripts/dataset_to_video.py` | renders a collected dataset back to side-by-side mp4. Looking at the data is how two of the worst bugs here were finally caught |
 
 ## 3. What's in the repo
 
@@ -81,7 +140,7 @@ drive, which matters more than it sounds.
 
 Each episode randomises the box position and the bin layout. Episodes are **rejection
 sampled** — only successful ones are kept. Everything is written out as a LeRobot dataset:
-one parquet of all episodes, images inlined as PNGs.
+a single parquet file covering all episodes, with the images inlined as PNGs.
 
 Two bugs in this stage cost more time than any model did.
 
@@ -89,8 +148,8 @@ Two bugs in this stage cost more time than any model did.
 soft, so it never quite reached the pose it was told to hold — it sagged under gravity and
 stayed there. The collector wrote every label as `(target − current) / scale`, which is the
 *tracking error*. The sag got baked into every label as a constant offset. Over 8700 frames,
-the 1st percentile of the sideways `dx` channel was **−0.08** — the data had almost no
-examples of pulling back, which was exactly the move that kept failing. Fixed by replacing the
+the 1st percentile of the `dx` channel was **−0.08** — the data held almost no examples of
+pulling the arm back, which was exactly the move that kept failing. Fixed by replacing the
 position actuators with an operational-space controller on torque actuators. Sag went from
 4.84 mm to **0.000 mm**. Datasets `a1`–`a4` were thrown out.
 
@@ -120,16 +179,16 @@ The datasets that survived:
 
 The first choice, and the wrong one. **DROID is pretrained on video of real robots** — real
 lighting, real cameras, an FR3 arm. Our input is a flat-shaded MuJoCo render of a Panda. That
-is two gaps at once: simulated-vs-real, and one arm vs another. It never placed the box, and
-neither did a 500-step fine-tune on top of it.
+is two gaps at once: simulated-vs-real, and one arm vs another. It never placed the ball, and
+neither did either fine-tune trained on top of it.
 
 There was also a bug underneath, which is the more useful story. **The simulator was ignoring
 97% of every command.** The client stepped physics *once* per action; the demos held each
 action for **33** steps. Every command got 2 ms of simulated time instead of 66 ms.
 
 It was found by feeding the expert's own perfect actions back through the client's code path.
-The box never moved from where it spawned. A perfect policy scored zero on that harness — so
-all three DROID fine-tunes had been graded against a ceiling of zero. Nine days went into
+The ball never moved from where it spawned. A perfect policy scored zero on that harness — so
+all three DROID evaluations had been graded against a ceiling of zero. Nine days went into
 arguing about which model was worse.
 
 > **Lesson:** run the expert through the inference path before blaming a policy. It is nearly
@@ -153,11 +212,12 @@ everything failing after that was our scene, our data, or our control.
 > **Lesson:** check robot parameters by compiling the model and reading real values, not by
 > reading the XML.
 
-But the money ran out before the training did. On a $5 budget, a LoRA run bought **150 steps =
-0.06 epochs** of the dataset. Saving a single checkpoint cost 150 s of GPU time, about 4% of
-the whole budget. At 0.06 epochs the model has barely moved off its base weights — the risk
-isn't overfitting, it's that no training happened at all. Later, properly funded fine-tunes on
-`a5` and `a7` scored 2/10 and 1/10, which is indistinguishable from the untrained baseline.
+But the money ran out long before the training could converge. On a $5 budget, a LoRA run
+bought **150 steps = 0.06 epochs** of the dataset, and saving a single checkpoint cost 150 s of
+GPU time — about 4% of the whole budget. At 0.06 epochs the model has barely moved off its base
+weights; the risk isn't overfitting, it's that no training happened at all. Later, properly
+funded fine-tunes on `a5` and `a7` scored 2/10 and 1/10, which is indistinguishable from the
+untrained baseline.
 
 > **Lesson:** a large model doesn't just cost more per step, it converts a fixed budget into
 > fewer steps. Check what your budget buys in *epochs* before picking the model.
@@ -179,26 +239,26 @@ The results split cleanly by how much data it got:
 > demos that looked like what it was pretrained on.
 
 One clear negative result: a variant that **unfroze the vision encoder** did worse, and
-steadily worse. Across 5 checkpoints × 10 seeds, the best score came from the *earliest*
+steadily worse. Across 5 checkpoints and 52 rollouts, the best score came from the *earliest*
 checkpoint (1/10 at step 488) and every later one scored zero. Unfreezing a pretrained vision
 tower and LoRA-ing it on 40 episodes damages features that were already good.
 
 ### 5.4 ACT — no pretraining at all
 
 ACT was added to settle a question: was SmolVLA missing the grasp because of *units*, or
-because it couldn't *see* well enough? ACT answers it directly by having no frozen vision at
+because it couldn't *see* well enough? ACT answered it directly by having no frozen vision at
 all — a ResNet18 in the gradient path from step 0, **51.6 M** trainable parameters, no
 pretraining to preserve.
 
 Trained on the same 60 demos the SmolVLA LoRA failed on, it placed the ball 5 times out of 6
-and picked it up **12 out of 12**. So it was seeing, not units. A model that can adapt its
+and picked it up **6 out of 6**. So it was seeing, not units. A model that can adapt its
 vision learns this task from 60 episodes; a frozen-tower LoRA on the same data does not.
 
 ## 6. How it was fine-tuned
 
 | policy | trainable | hardware | steps | notes |
 |---|---|---|---|---|
-| MolmoAct2-LIBERO | LoRA r32 | L4 24 GB | 150 → later runs longer | $5 bought 0.06 epochs |
+| MolmoAct2-LIBERO | LoRA r32 | L4 24 GB | 150 (later runs longer) | $5 bought 0.06 epochs |
 | SmolVLA (`a5`/`a7`) | action expert only | T4 16 GB | 5000 | vision + language frozen |
 | SmolVLA (`b1`) | action expert **+ vision** | L4 | 2438 | the unfreeze experiment |
 | SmolVLA (rebuilt) | 99.9 M of 450 M (22.2%) | L4 | 12 000 | batch 16, lr 1e-4 cosine, bf16, ~96 min |
@@ -212,8 +272,8 @@ than one step proves nothing extra and costs real money.
 
 ## 7. Results
 
-`placed` means the task succeeded. `lift` means the box left the table in the gripper — worth
-tracking separately, because for most of these it's as far as they ever got.
+`placed` means the task succeeded. `lift` means the object left the table in the gripper —
+worth tracking separately, because for most of these it is as far as they ever got.
 
 | # | policy | data | target | placed | lift |
 |---|---|---|---|---|---|
@@ -228,15 +288,16 @@ tracking separately, because for most of these it's as far as they ever got.
 | 9 | SmolVLA-450M, LoRA + vision, 5 ck | `b1` | **box** | 1/52 | 2/52 |
 | 10 | **ACT, from scratch** | `a7`, 60 eps | ball | **5/6** | **6/6** |
 | 11 | ACT, trained 3× longer | `a7` | ball | 6/8 | 8/8 |
-| 12 | **SmolVLA-450M, rebuilt task** | 300 demos | box | **36%** | 84% grasped |
+| 12 | **SmolVLA-450M, rebuilt task** | 300 demos | box | **36%** | 36% |
 
-Rows 1–3 measured the decimation bug, not a policy. Row 7 † finished the task but has no
+Rows 1–3 measured the decimation bug, not a policy. Row 7 (†) finished the task but has no
 scored rollouts — only the observation that it worked, slowly. Row 10's 5/6 is the six
-evaluation seeds; across all twelve logged rollouts, including six deliberately awkward box
-positions, it's 7/12 placed and 12/12 lifted. Row 12 is a different scene with harder
-language — three trays whose colours shuffle every episode, so "the green one" can't be
-memorised as a position — scored over 25 episodes against a scripted expert at 100% and random
-actions at 0%.
+evaluation seeds; across all twelve logged rollouts, including six deliberately awkward ball
+positions, it is 7/12 placed and 12/12 lifted. Row 12 was run in a different scene with harder
+language — three trays whose colours shuffle every episode, so "the green one" cannot be
+memorised as a position. It was scored over 25 episodes, with a scripted expert at 100% and
+random actions at 0% as the two reference points. It got a grasp in 84% of those episodes but
+placed the box in only 36% — the gap between those two numbers is the second finding below.
 
 ### What success and failure actually look like
 
@@ -249,8 +310,9 @@ the ball-era scene.
 
 The failure on the right is the one that matters: ACT grasps and carries perfectly, parks over
 the green bin, and then just holds on. Nothing about the reach is wrong. At this checkpoint the
-release was a clean function of one number — every `dx ≤ −0.048` held on, everything above let
-go, no exceptions — so an inward carry simply never released.
+release was a clean function of a single number — `dx`, the sideways gap between the green bin
+and the ball. Every run with `dx ≤ −0.048` held on and every run above it let go, with no
+exceptions, so a carry that pulled the arm inward simply never released.
 
 **SmolVLA on 300 demos** (row 12), the rebuilt scene. Agent view, wrist view, and a HUD showing
 the seven action channels, the target slot, and the success flag. Tray colours are shuffled
@@ -268,13 +330,13 @@ just stuck re-attempting a grasp it keeps getting slightly wrong.
 Three findings came out of comparing them.
 
 **The gripper was a channel nobody taught.** Across 20 MolmoAct2 rollouts, every single lift
-and every single placement came from a run where the gripper closed *at all* — and it closed
-in exactly half of them. Worse, closing was nearly uncorrelated with the hand being near the
-box: one run closed 0.7 mm away but 58 chunks too late, another did a full close-carry-release
-on an empty hand 39 mm away. The cause is in the data: the expert only ever closes on a
-perfectly centred, stationary box, and rejection sampling deletes every episode where contact
-went wrong. The states the policy is actually in when it has to decide are absent from
-training **by construction**.
+and every single placement came from a run in which the gripper closed *at all* — and it
+closed in exactly half of them. Worse, closing was nearly uncorrelated with the hand being near
+the ball: one run closed 0.7 mm away but 58 chunks too late, another did a full
+close-carry-release on an empty hand 39 mm away. The cause is in the data: the expert only ever
+closes on a perfectly centred, stationary ball, and rejection sampling deletes every episode
+where contact went wrong. The states the policy is actually in when it has to decide are absent
+from training **by construction**.
 
 **In the rebuilt task, the bottleneck was the wrist, not the language.** Colour grounding was
 never the problem — across every checkpoint, the policy put the box in a wrong-coloured tray
@@ -284,17 +346,16 @@ say why: at the moment it closes, the gripper is 0.045 m from the box (close eno
 same episode. It reaches the right place with the right angle, then rotates away before
 closing. This is where the ball-to-box change bites — a sphere would have forgiven it.
 
-**The last checkpoint is not the best one.** Shown three times, on three different models. ACT
-at 10 k had a clean rule for when it let go — every `dx ≤ −0.048` held on, everything above
-released, no exceptions. At 30 k it placed slightly more often but that rule went ragged, even
-as its motion got smoother and its grasps got tighter. SmolVLA's 3 k checkpoint beat its 5 k
-one. The unfreeze sweep peaked at its very first checkpoint. **Score intermediate
-checkpoints.**
+**The last checkpoint is not the best one.** Shown three times, across two architectures. ACT
+at 10 k had the clean release rule described above. At 30 k it placed slightly more often, but
+that rule went ragged — even as its motion got smoother and its grasps got tighter. SmolVLA's
+3 k checkpoint beat its 5 k one. The unfreeze sweep peaked at its very first checkpoint.
+**Score intermediate checkpoints.**
 
 One more, found by accident: **the scorer itself was wrong.** A run reported `placed 32%` and
 `released 8%`, which is impossible — you have to let go before it counts as placed. `released`
 was being recorded the *first* time the gripper lost contact, and contact flickers during
-transport. Changed to the last let-go, the numbers lined up.
+transport. Once it was changed to the last let-go, the numbers lined up.
 
 > **Lesson:** build the metric as a chain where each stage requires the one before it, then
 > look for totals that can't happen.
@@ -302,8 +363,8 @@ transport. Changed to the last let-go, the numbers lined up.
 ## 8. What's next
 
 **Fine-tune the VLM properly.** The unfreeze experiment failed, but it failed on 40 episodes.
-The question of whether the language model can be adapted rather than damaged is still open,
-and 300+ demos is the setting to ask it in.
+The question of whether the vision-language stack can be adapted rather than damaged is still
+open, and 300+ demos is the setting to ask it in.
 
 **A small patch-based policy for lightweight tasks.** Most of what this task needs is local:
 where the box is relative to the gripper. A policy operating on image patches instead of a
