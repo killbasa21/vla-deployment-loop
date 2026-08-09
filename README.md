@@ -142,26 +142,13 @@ Each episode randomises the box position and the bin layout. Episodes are **reje
 sampled** — only successful ones are kept. Everything is written out as a LeRobot dataset:
 a single parquet file covering all episodes, with the images inlined as PNGs.
 
-Two bugs in this stage cost more time than any model did.
-
-**The labels were measuring error, not intent.** The arm used position actuators that were too
-soft, so it never quite reached the pose it was told to hold — it sagged under gravity and
-stayed there. The collector wrote every label as `(target − current) / scale`, which is the
-*tracking error*. The sag got baked into every label as a constant offset. Over 8700 frames,
-the 1st percentile of the `dx` channel was **−0.08** — the data held almost no examples of
-pulling the arm back, which was exactly the move that kept failing. Fixed by replacing the
-position actuators with an operational-space controller on torque actuators. Sag went from
-4.84 mm to **0.000 mm**. Datasets `a1`–`a4` were thrown out.
-
-> **Lesson:** labels must come from the controller that consumes them. Any label written as
-> `target − current` inherits the robot's tracking error as training signal.
-
-**A rotation took the long way round.** In the rebuilt task the scripted expert — the thing
-that generates *all* the data — scored 0/10. Cause: `q` and `−q` describe the same rotation,
-but only one unwraps the short way. A wrist error of −0.77 rad came out as **5.51 rad**, which
-maxed out the rotation channels; because the controller mixes rotation into position, the arm
-was pulled *up* instead of down onto the box. Flipping the sign when `w < 0` took the expert
-from **0/10 to 10/10**.
+The expensive lesson here was that **labels have to come from the controller that consumes
+them**. Ours were written as `(target − current) / scale` — tracking error rather than intent —
+so a soft-actuated arm baked its own sag into every label as a constant offset. Moving to
+operational-space control on torque actuators took that sag from 4.84 mm to **0.000 mm**;
+datasets `a1`–`a4` were collected before the fix and discarded. The other correction worth
+knowing about — a quaternion unwrapping the long way round, which took the scripted expert from
+0/10 to **10/10** — is written up in [`libero/PROGRESS.md`](libero/PROGRESS.md).
 
 The datasets that survived:
 
