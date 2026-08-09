@@ -329,34 +329,30 @@ just re-attempting a grasp it keeps getting slightly wrong.
 
 Four findings:
 
-**The gripper was a channel nobody taught.** Across 20 MolmoAct2 rollouts, every single lift
-and every single placement came from a run in which the gripper closed *at all* — and it
-closed in exactly half of them. Worse, closing was nearly uncorrelated with the hand being near
-the ball: one run closed 0.7 mm away but 58 chunks too late, another did a full
-close-carry-release on an empty hand 39 mm away. The cause is in the data: the expert only ever
-closes on a perfectly centred, stationary ball, and rejection sampling deletes every episode
-where contact went wrong. The states the policy is actually in when it has to decide are absent
-from training **by construction**.
+**The gripper was a channel nobody taught.** Across 20 MolmoAct2 rollouts, every lift and every
+placement came from a run where the gripper closed *at all* — and it closed in half of them,
+almost uncorrelated with being near the ball: one closed 0.7 mm away but 58 chunks late, another
+did a full close-carry-release on an empty hand 39 mm out. Rejection sampling is why. The expert
+only ever closes on a centred, stationary ball, so the states the policy is actually in when it
+has to decide are absent from training **by construction**.
 
-**In the rebuilt task, the bottleneck was the wrist, not the language.** Colour grounding was
-never the problem — across every checkpoint, the policy put the box in a wrong-coloured tray
-**0 times out of 25**. But it grasped 84% of the time and only lifted 36%. The measurements
-say why: at the moment it closes, the gripper is 0.045 m from the box (close enough) but
-**0.394 rad off in wrist angle**, against 0.048 rad it had already achieved earlier in the
-same episode. It reaches the right place with the right angle, then rotates away before
-closing. This is where the ball-to-box change bites — a sphere would have forgiven it.
+**The bottleneck was the wrist, not the language.** Colour grounding was never the problem — the
+rebuilt policy put the box in a wrong-coloured tray **0 times out of 25** — but it grasped 84%
+of the time and lifted 36%. At the moment it closes, the gripper is 0.045 m from the box (close
+enough) and **0.394 rad off in wrist angle**, against 0.048 rad it had already hit earlier in
+the same episode. Right place, right angle, then it rotates away before closing. A sphere would
+have forgiven that; a cube doesn't.
 
-**The last checkpoint is not the best one.** Shown three times, across two architectures. ACT
-at 10 k had the clean release rule described above. At 30 k it placed slightly more often, but
-that rule went ragged — even as its motion got smoother and its grasps got tighter. SmolVLA's
-3 k checkpoint beat its 5 k one. The unfreeze sweep peaked at its very first checkpoint.
-**Score intermediate checkpoints.**
+**The last checkpoint is not the best one.** Three times, across two architectures: ACT's clean
+release rule at 10 k went ragged by 30 k even as its motion smoothed and its grasps tightened,
+SmolVLA's 3 k beat its 5 k, and the unfreeze sweep peaked at its first checkpoint. **Score
+intermediate checkpoints.**
 
-**A metric should be able to catch itself.** The scorer grades success as a chain — grasp, then
-lift, then place, then release — where each stage requires the one before it. That structure is
-what surfaced `placed 32%` against `released 8%`: an impossible pair, since letting go is a
-precondition for placing. `released` was keyed to the *first* loss of contact, and contact
-flickers during transport. Keyed to the last let-go, the numbers reconciled.
+**A metric should be able to catch itself.** The scorer grades success as a chain — grasp, lift,
+place, release — each stage requiring the one before it. That is what surfaced `placed 32%`
+against `released 8%`: impossible, since letting go precedes placing. `released` was keyed to
+the *first* loss of contact, which flickers during transport; keyed to the last let-go, the
+numbers reconciled.
 
 ## 8. What's next
 
